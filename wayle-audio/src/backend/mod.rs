@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use types::{
     CommandReceiver, DefaultDevice, DeviceStore, EventSender, ExternalCommand, InternalRefresh,
-    Mutation, Responder, StreamStore,
+    Mutation, Responder, Snapshot, StreamStore,
 };
 
 use crate::{Error, events::AudioEvent, tokio_mainloop::TokioMain};
@@ -42,6 +42,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Outlives individual connections: it is cleared when a connection is lost
 /// and repopulated by the discovery that runs on every new connection.
+/// Clones share the same stores.
+#[derive(Clone)]
 struct BackendState {
     devices: DeviceStore,
     streams: StreamStore,
@@ -50,6 +52,34 @@ struct BackendState {
 }
 
 impl BackendState {
+    /// Copies the current contents of every store.
+    fn snapshot(&self) -> Result<Snapshot, Error> {
+        let read_default = |store: &DefaultDevice| {
+            store
+                .read()
+                .map(|default| default.clone())
+                .map_err(|_| Error::LockPoisoned)
+        };
+        Ok(Snapshot {
+            devices: self
+                .devices
+                .read()
+                .map_err(|_| Error::LockPoisoned)?
+                .values()
+                .cloned()
+                .collect(),
+            streams: self
+                .streams
+                .read()
+                .map_err(|_| Error::LockPoisoned)?
+                .values()
+                .cloned()
+                .collect(),
+            default_input: read_default(&self.default_input)?,
+            default_output: read_default(&self.default_output)?,
+        })
+    }
+
     fn new() -> Self {
         Self {
             devices: Arc::new(RwLock::new(HashMap::new())),
@@ -236,8 +266,7 @@ impl PulseBackend {
         gate: CommandGate,
         cancellation_token: CancellationToken,
     ) -> JoinHandle<()> {
-        let devices = state.devices.clone();
-        let streams = state.streams.clone();
+        let state = state.clone();
 
         spawn(async move {
             loop {
@@ -252,7 +281,7 @@ impl PulseBackend {
                             return;
                         };
 
-                        Self::handle_command(command, &devices, &streams, &gate);
+                        Self::handle_command(command, &state, &gate);
                     }
                 }
             }
@@ -260,18 +289,16 @@ impl PulseBackend {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn handle_command(
-        command: Command,
-        devices: &DeviceStore,
-        streams: &StreamStore,
-        gate: &CommandGate,
-    ) {
+    fn handle_command(command: Command, state: &BackendState, gate: &CommandGate) {
         match command {
+            Command::Snapshot { responder } => {
+                let _ = responder.send(state.snapshot());
+            }
             Command::GetDevice {
                 device_key,
                 responder,
             } => {
-                let result = if let Ok(devices_guard) = devices.read() {
+                let result = if let Ok(devices_guard) = state.devices.read() {
                     devices_guard
                         .values()
                         .find(|d| d.key() == device_key)
@@ -289,7 +316,7 @@ impl PulseBackend {
                 stream_key,
                 responder,
             } => {
-                let result = if let Ok(streams_guard) = streams.read() {
+                let result = if let Ok(streams_guard) = state.streams.read() {
                     streams_guard
                         .values()
                         .find(|s| s.key() == stream_key)
@@ -530,7 +557,7 @@ impl Connector for PulseBackend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
 
     use libpulse_binding::time::MicroSeconds;
@@ -582,7 +609,7 @@ mod tests {
         }
     }
 
-    fn sink(index: u32) -> Device {
+    pub(crate) fn sink(index: u32) -> Device {
         Device::Sink(SinkInfo {
             device: device_info(index),
             monitor_source: index + 100,

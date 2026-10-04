@@ -77,6 +77,15 @@ pub(crate) enum InternalRefresh {
     },
 }
 
+/// A copy of everything the backend currently knows about the server.
+#[derive(Debug, Default)]
+pub(crate) struct Snapshot {
+    pub devices: Vec<Device>,
+    pub streams: Vec<StreamInfo>,
+    pub default_input: Option<Device>,
+    pub default_output: Option<Device>,
+}
+
 /// Reply channel for a mutation.
 pub(crate) type Responder = oneshot::Sender<Result<(), Error>>;
 

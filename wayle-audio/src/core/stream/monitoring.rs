@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
+use tokio::sync::{broadcast::error::RecvError, oneshot};
 use tracing::debug;
 use wayle_traits::ModelMonitoring;
 
 use crate::{
+    backend::{commands::Command, types::CommandSender},
     core::stream::AudioStream,
     error::{Error, MissingMonitoringComponent},
     events::AudioEvent,
-    types::stream::StreamState,
+    types::stream::{StreamInfo, StreamKey, StreamState},
 };
 
 impl ModelMonitoring for AudioStream {
@@ -33,31 +35,44 @@ impl ModelMonitoring for AudioStream {
 
         tokio::spawn(async move {
             loop {
-                let Some(stream) = weak_stream.upgrade() else {
-                    return;
-                };
-
-                tokio::select! {
+                let event = tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         debug!("AudioStream monitor cancelled for {:?}", stream_key);
                         return;
                     }
-                    Ok(event) = event_rx.recv() => {
-                        match event {
-                            AudioEvent::StreamChanged(info) if info.key() == stream_key => {
-                                if info.instance != stream.instance {
-                                    // Another stream took over the index.
-                                    stream.state.set(StreamState::Terminated);
-                                    break;
-                                }
-                                stream.update_from_info(&info);
-                            }
-                            AudioEvent::StreamRemoved(key) if key == stream_key => {
-                                stream.state.set(StreamState::Terminated);
-                                break;
-                            }
-                            _ => {}
-                        }
+                    event = event_rx.recv() => event,
+                };
+
+                let Some(stream) = weak_stream.upgrade() else {
+                    return;
+                };
+
+                let current = match event {
+                    Ok(AudioEvent::StreamChanged(info)) if info.key() == stream_key => Some(info),
+                    Ok(AudioEvent::StreamRemoved(key)) if key == stream_key => None,
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(missed)) => {
+                        // The removal or change of this stream may be among
+                        // the lost events, so ask the backend for its state.
+                        debug!(
+                            missed,
+                            ?stream_key,
+                            "AudioStream monitor lagged, refreshing"
+                        );
+                        event_rx = event_rx.resubscribe();
+                        fetch(&stream.command_tx, stream_key).await
+                    }
+                    Err(RecvError::Closed) => return,
+                };
+
+                match current {
+                    Some(info) if info.instance == stream.instance => {
+                        stream.update_from_info(&info);
+                    }
+                    // Gone, or another stream took over the index.
+                    _ => {
+                        stream.state.set(StreamState::Terminated);
+                        return;
                     }
                 }
             }
@@ -65,4 +80,16 @@ impl ModelMonitoring for AudioStream {
 
         Ok(())
     }
+}
+
+/// Current state of the stream with `stream_key`, if it exists.
+async fn fetch(command_tx: &CommandSender, stream_key: StreamKey) -> Option<StreamInfo> {
+    let (responder, reply) = oneshot::channel();
+    command_tx
+        .send(Command::GetStream {
+            stream_key,
+            responder,
+        })
+        .ok()?;
+    reply.await.ok()?.ok()
 }

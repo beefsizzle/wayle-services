@@ -4,6 +4,7 @@ pub(crate) mod stream;
 
 use tokio::sync::oneshot;
 
+use super::types::Snapshot;
 use crate::{
     error::Error,
     types::{
@@ -15,6 +16,10 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) enum Command {
+    /// Reads the whole backend state, for observers that lost events.
+    Snapshot {
+        responder: oneshot::Sender<Result<Snapshot, Error>>,
+    },
     GetDevice {
         device_key: DeviceKey,
         responder: oneshot::Sender<Result<Device, Error>>,

@@ -16,6 +16,14 @@ use crate::{
     service::AudioService,
 };
 
+/// Capacity of the backend event channel.
+///
+/// Every reconnect emits a removal for each known object and then, shortly
+/// after, an addition for each one, so this has room for a few hundred
+/// objects. Receivers that still fall behind resynchronize from the backend
+/// stores instead of losing events.
+const EVENT_CHANNEL_CAPACITY: usize = 512;
+
 /// Builder for configuring and creating an AudioService instance.
 ///
 /// Allows optional D-Bus daemon registration for external control.
@@ -53,7 +61,7 @@ impl AudioServiceBuilder {
     /// Returns error if monitoring cannot be started or D-Bus registration fails.
     pub async fn build(self) -> Result<Arc<AudioService>, Error> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (event_tx, _) = broadcast::channel(100);
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let cancellation_token = CancellationToken::new();
 
         let output_devices = Property::new(Vec::new());
