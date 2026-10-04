@@ -15,7 +15,7 @@ use std::{
 
 pub(crate) use daemon::spawn_daemon_if_needed;
 use tokio::{process::Command, sync::Notify};
-use tracing::instrument;
+use tracing::{debug, instrument};
 pub use transition::{
     BezierCurve, Position, TransitionAngle, TransitionConfig, TransitionDuration, TransitionFps,
     TransitionStep, TransitionType, WaveDimensions,
@@ -28,6 +28,12 @@ const DAEMON_STARTING: u8 = 1;
 const DAEMON_SETTLED: u8 = 2;
 
 const DAEMON_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The daemon answers `query` as soon as its socket is up, which can be before it has
+/// enumerated the Wayland outputs. Early `img` calls then fail with this message.
+const OUTPUTS_NOT_READY: &str = "none of the requested outputs are valid";
+const OUTPUTS_RETRY_ATTEMPTS: u32 = 10;
+const OUTPUTS_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Lifecycle of the startup thread. `SETTLED` means it finished, whether or not the daemon
 /// came up; callers then proceed and surface the real error from the client.
@@ -146,13 +152,27 @@ impl AwwwBackend {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
-        let output = cmd.output().await.map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                Error::AwwwNotInstalled
-            } else {
-                Error::Io(err)
+        let mut retries = 0;
+        let output = loop {
+            let output = cmd.output().await.map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    Error::AwwwNotInstalled
+                } else {
+                    Error::Io(err)
+                }
+            })?;
+
+            let outputs_not_ready = !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).contains(OUTPUTS_NOT_READY);
+
+            if !outputs_not_ready || retries >= OUTPUTS_RETRY_ATTEMPTS {
+                break output;
             }
-        })?;
+
+            retries += 1;
+            debug!(retries, "daemon has not enumerated outputs yet, retrying");
+            tokio::time::sleep(OUTPUTS_RETRY_DELAY).await;
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
