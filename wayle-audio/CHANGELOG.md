@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Error::NotConnected`, returned by device and stream commands while no audio server is connected (they used to return `Ok` without doing anything)
+- `Error::InvalidChannelCount`, returned for volumes with no channels or more than 32 instead of crashing the backend
+
+### Fixed
+
+- connect in the background, and reconnect with backoff when the audio server is missing at startup or restarts
+- a device or stream handle kept across a server restart no longer changes whichever object reused its index; its commands return `DeviceNotFound` / `StreamNotFound`
+- device commands address devices by name instead of by index
+- notice a failed server connection even when no socket event fires, instead of hanging and panicking on the next command
+- monitors that fall behind the event channel resynchronize instead of keeping removed devices or losing the default device
+- a server that keeps restarting no longer floods the log
+
 ## [0.1.4](https://github.com/wayle-rs/wayle-services/compare/wayle-audio-v0.1.3...wayle-audio-v0.1.4) - 2026-06-03
 
 ### Fixed
