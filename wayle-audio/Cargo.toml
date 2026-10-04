@@ -24,7 +24,7 @@ wayle-traits.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true

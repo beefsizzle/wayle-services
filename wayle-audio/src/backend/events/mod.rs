@@ -2,7 +2,7 @@ use libpulse_binding::context::{
     Context,
     subscribe::{Facility, InterestMaskSet, Operation},
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -24,12 +24,12 @@ pub(crate) fn start_event_processor(
     events_tx: EventSender,
     internal_command_tx: InternalCommandSender,
     cancellation_token: CancellationToken,
-) -> Result<(), Error> {
+) -> Result<JoinHandle<()>, Error> {
     let (change_tx, mut change_rx) = mpsc::unbounded_channel::<ChangeNotification>();
 
     setup_subscription(context, change_tx)?;
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
@@ -54,7 +54,7 @@ pub(crate) fn start_event_processor(
         }
     });
 
-    Ok(())
+    Ok(handle)
 }
 
 fn setup_subscription(
