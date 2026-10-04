@@ -9,8 +9,11 @@
 //! `arg0`-filtered `NameOwnerChanged` for exactly its owner connection (and, when it
 //! registered a well-known name, for that name too) and tears the item down when the
 //! owner disappears or the name is released. There is no periodic reconciliation and no
-//! polling — the only non-listener query is a single liveness check per item, armed
-//! *after* the death watch so the "owner already gone" gap is closed by construction.
+//! polling. The only non-listener queries are one-shot: a bus-name registration first
+//! resolves its owner (`GetNameOwner`), which is all a repeat of an already shown item
+//! costs; a new item then checks, *after* its watches are armed, that the owner is still
+//! connected and (for a well-known name) still owns the name, so the "already gone
+//! before the watch existed" gap is closed by construction.
 //!
 //! [`SystemTrayService::items`]: crate::service::SystemTrayService::items
 
@@ -60,6 +63,10 @@ struct Entry {
     item: Arc<TrayItem>,
     /// Cancels this item's lifecycle task and its property monitor.
     cancel: CancellationToken,
+    /// A later registration of this same item was absorbed into this entry (see
+    /// [`absorb_repeat`]). If the entry then goes away, that registration is evaluated
+    /// again rather than lost; see the `Remove` handling in [`run_registrar`].
+    absorbed_repeat: bool,
 }
 
 /// Messages accepted by the registrar actor.
@@ -89,6 +96,14 @@ pub(crate) enum RegistrarMsg {
     Remove { id: u64 },
     /// Reply with the current registered service strings (for the D-Bus property).
     Query { reply: oneshot::Sender<Vec<String>> },
+    /// A bus-name registration resolved to `key`. If that is a repeat of an item that is
+    /// already shown, the shown item re-reads its properties and the reply is `true`, so
+    /// the caller can skip building the item again.
+    AbsorbIfLive {
+        key: ItemKey,
+        service: String,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Cloneable handle used by producers (the watcher interface, discovery, host-mode
@@ -116,6 +131,24 @@ impl RegistrarHandle {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    /// Asks whether `service`, resolved to `key`, repeats a registration that is already
+    /// shown; if so the shown item resyncs and this returns `true`.
+    async fn absorb_if_live(&self, key: ItemKey, service: String) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(RegistrarMsg::AbsorbIfLive {
+                key,
+                service,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     fn send(&self, msg: RegistrarMsg) {
@@ -173,15 +206,23 @@ async fn run_registrar(
                 match msg {
                     RegistrarMsg::Register { service, sender } => {
                         next_id += 1;
-                        handle_register(&handle, &conn, &cancellation_token, &entries, next_id, service, sender);
+                        handle_register(&handle, &conn, &cancellation_token, &mut entries, next_id, service, sender);
                     }
                     RegistrarMsg::Insert { id, key, service, item, cancel } => {
-                        let new_entry = Entry { id, key, service: service.clone(), item, cancel };
+                        let new_entry = Entry {
+                            id,
+                            key,
+                            service: service.clone(),
+                            item,
+                            cancel,
+                            absorbed_repeat: false,
+                        };
                         match plan_insert(&entries, &new_entry.key, &service) {
-                            InsertPlan::Discard => {
-                                // Already present under this string (or a concurrent register
-                                // for it won the race), or a weaker bare-unique-name shape.
+                            InsertPlan::Discard(pos) => {
+                                // Already present under this string (a concurrent register for
+                                // it won the race), or a weaker bare-unique-name shape.
                                 new_entry.cancel.cancel();
+                                absorb_repeat(&mut entries[pos]);
                             }
                             InsertPlan::Push => {
                                 entries.push(new_entry);
@@ -207,6 +248,16 @@ async fn run_registrar(
                             entry.cancel.cancel();
                             publish(&items, &entries);
                             emit_signal(&watcher_conn, "StatusNotifierItemUnregistered", &entry.service).await;
+                            if entry.absorbed_repeat && well_known_name(&entry.service).is_some() {
+                                // A repeat of this name was absorbed, but the entry is now
+                                // gone. The repeat may have come from the name's *next*
+                                // ownership (Qt hides and re-shows an icon by releasing and
+                                // re-acquiring the same name) and merely beaten the removal
+                                // here. Re-resolve it: if nobody owns the name any more,
+                                // this costs one GetNameOwner and is dropped.
+                                next_id += 1;
+                                handle_register(&handle, &conn, &cancellation_token, &mut entries, next_id, entry.service, None);
+                            }
                         }
                     }
                     RegistrarMsg::RemoveByService { service } => {
@@ -219,6 +270,16 @@ async fn run_registrar(
                     }
                     RegistrarMsg::Query { reply } => {
                         let _ = reply.send(entries.iter().map(|e| e.service.clone()).collect());
+                    }
+                    RegistrarMsg::AbsorbIfLive { key, service, reply } => {
+                        let absorbed = match plan_insert(&entries, &key, &service) {
+                            InsertPlan::Discard(pos) => {
+                                absorb_repeat(&mut entries[pos]);
+                                true
+                            }
+                            InsertPlan::Push | InsertPlan::Replace(_) => false,
+                        };
+                        let _ = reply.send(absorbed);
                     }
                 }
             }
@@ -233,9 +294,9 @@ enum InsertPlan {
     Push,
     /// Same object already present under a different service string: replace that entry.
     Replace(usize),
-    /// Same object already present under this string, or the new string is the weaker
-    /// bare-unique-name shape (startup discovery): keep the existing entry.
-    Discard,
+    /// Same object already present (at this index) under this string, or the new string
+    /// is the weaker bare-unique-name shape (startup discovery): keep the existing entry.
+    Discard(usize),
 }
 
 fn plan_insert(entries: &[Entry], key: &ItemKey, service: &str) -> InsertPlan {
@@ -256,7 +317,7 @@ fn plan_insert_by<'a>(
             continue;
         }
         if existing_service == service || is_bare_unique_name(service) {
-            return InsertPlan::Discard;
+            return InsertPlan::Discard(pos);
         }
         return InsertPlan::Replace(pos);
     }
@@ -280,6 +341,18 @@ fn well_known_name(service: &str) -> Option<&str> {
     (!name.starts_with(':') && !name.is_empty()).then_some(name)
 }
 
+/// Folds a repeated registration of a shown item into its entry.
+///
+/// Apps re-register a live item for several reasons: some call `Register` in a loop,
+/// every Qt/Electron app re-registers when the watcher restarts, and a libappindicator
+/// app that recreates its indicator at the same path registers that path again. Building
+/// the item again would be wasted work, but the app may have changed its properties
+/// without signalling, so the shown item re-reads everything instead.
+fn absorb_repeat(entry: &mut Entry) {
+    entry.absorbed_repeat = true;
+    entry.item.request_resync();
+}
+
 fn publish(items: &Property<Vec<Arc<TrayItem>>>, entries: &[Entry]) {
     items.set(entries.iter().map(|e| e.item.clone()).collect());
 }
@@ -301,16 +374,21 @@ async fn emit_signal(watcher_conn: &Option<Connection>, member: &str, service: &
 
 /// Dispatches a registration request onto a per-item lifecycle task.
 ///
-/// Dedup is intentionally done only against live `entries` here and again at `Insert`
-/// time (a duplicate loses the race and is cancelled). There is deliberately no
-/// "pending" reservation: a lifecycle that aborts (e.g. a transient `get_live` failure)
-/// simply leaves nothing behind, so a re-registration always spawns a fresh, self-healing
-/// lifecycle rather than being swallowed by a slot that is about to be released.
+/// A repeat of an item that is already shown is absorbed (see [`absorb_repeat`]) instead
+/// of being built again: here for the object-path form, whose owner is known
+/// synchronously; right after owner resolution for the bus-name form (see
+/// [`resolve_then_run`]); and, as the backstop for two registrations of a not-yet-shown
+/// item racing each other, at `Insert` time, where the loser is cancelled.
+///
+/// There is deliberately no "pending" reservation: a lifecycle that aborts (e.g. a
+/// transient `get_live` failure) simply leaves nothing behind, so a re-registration
+/// always spawns a fresh, self-healing lifecycle rather than being swallowed by a slot
+/// that is about to be released.
 fn handle_register(
     handle: &RegistrarHandle,
     conn: &Connection,
     cancellation_token: &CancellationToken,
-    entries: &[Entry],
+    entries: &mut [Entry],
     id: u64,
     service: String,
     sender: Option<OwnedUniqueName>,
@@ -324,7 +402,8 @@ fn handle_register(
                 owner: owner.clone(),
                 path,
             };
-            if plan_insert(entries, &key, &callable) == InsertPlan::Discard {
+            if let InsertPlan::Discard(pos) = plan_insert(entries, &key, &callable) {
+                absorb_repeat(&mut entries[pos]);
                 return;
             }
             tokio::spawn(item_lifecycle(
@@ -384,6 +463,18 @@ async fn resolve_then_run(
         owner: owner.clone(),
         path: path.to_string(),
     };
+
+    // The common repeat (an app calling `Register` again for an item that is shown)
+    // stops here, at the cost of the one `GetNameOwner` above, instead of arming watches
+    // and building the item only for `Insert` to discard it. The answer can be stale by
+    // the time the registrar reads it (the shown entry may be about to go because its
+    // name was just released); the registrar re-evaluates an absorbed repeat when its
+    // entry is removed, so that race cannot lose the registration.
+    if handle.absorb_if_live(key.clone(), service.clone()).await {
+        debug!(service = %service, "repeat registration of a shown item, resyncing it");
+        return;
+    }
+
     item_lifecycle(handle, conn, cancel, id, service, owner, key).await;
 }
 
@@ -435,26 +526,8 @@ async fn item_lifecycle(
         None => None,
     };
 
-    // One-shot liveness check (not polling): closes the "owner already dead before the
-    // watch was armed" register-after-death race by construction.
-    let alive = match BusName::try_from(owner.as_str()) {
-        Ok(bus_name) => matches!(dbus.name_has_owner(bus_name).await, Ok(true)),
-        Err(_) => true,
-    };
-    if !alive {
+    if !still_owned(&dbus, &owner, well_known.as_deref()).await {
         return;
-    }
-
-    // The name must still belong to `owner` now that the watch is armed; if it was
-    // released or changed hands since the owner was resolved, there is nothing to show.
-    if let Some(name) = &well_known {
-        let Ok(bus_name) = BusName::try_from(name.as_str()) else {
-            return;
-        };
-        match dbus.get_name_owner(bus_name).await {
-            Ok(name_owner) if name_owner.as_str() == owner.as_str() => {}
-            _ => return,
-        }
     }
 
     let params = LiveTrayItemParams {
@@ -490,6 +563,33 @@ async fn item_lifecycle(
         }
         () = cancel.cancelled() => {}
     }
+}
+
+/// The one-shot checks run once the watches are armed (not polling).
+///
+/// The owner must still be connected: this closes the "owner already dead before the
+/// watch was armed" register-after-death race by construction. A well-known name must
+/// still belong to `owner`: if it was released or changed hands since the owner was
+/// resolved, there is nothing to show.
+async fn still_owned(
+    dbus: &DBusProxy<'_>,
+    owner: &OwnedUniqueName,
+    well_known: Option<&str>,
+) -> bool {
+    let alive = match BusName::try_from(owner.as_str()) {
+        Ok(bus_name) => matches!(dbus.name_has_owner(bus_name).await, Ok(true)),
+        Err(_) => true,
+    };
+    let Some(name) = well_known else {
+        return alive;
+    };
+    if !alive {
+        return false;
+    }
+    let Ok(bus_name) = BusName::try_from(name) else {
+        return false;
+    };
+    matches!(dbus.get_name_owner(bus_name).await, Ok(name_owner) if name_owner.as_str() == owner.as_str())
 }
 
 /// Resolves once the item is gone: its owner connection disconnected, or (when it
@@ -617,7 +717,7 @@ mod tests {
             "org.kde.StatusNotifierItem-1-1",
         );
 
-        assert_eq!(result, InsertPlan::Discard);
+        assert_eq!(result, InsertPlan::Discard(0));
     }
 
     #[test]
@@ -653,7 +753,7 @@ mod tests {
 
         let result = plan(&existing, &key(":1.1", ITEM_OBJECT_PATH), ":1.1");
 
-        assert_eq!(result, InsertPlan::Discard);
+        assert_eq!(result, InsertPlan::Discard(0));
     }
 
     #[test]

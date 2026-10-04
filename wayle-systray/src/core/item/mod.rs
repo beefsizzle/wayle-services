@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use controls::TrayItemController;
 use futures::{Stream, StreamExt};
+pub(crate) use monitoring::PendingRefresh;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use types::TrayItemProperties;
@@ -40,6 +41,8 @@ struct ServiceIdentifier<'a> {
 pub struct TrayItem {
     pub(crate) zbus_connection: Connection,
     pub(crate) cancellation_token: Option<CancellationToken>,
+    /// Refresh work owed to this item, drained by its monitor's refresh worker.
+    pub(crate) refresh: Arc<PendingRefresh>,
 
     /// D-Bus service name (e.g., "org.kde.StatusNotifierItem-12345-1").
     pub bus_name: Property<String>,
@@ -621,6 +624,16 @@ impl TrayItem {
         Ok(stream.filter_map(|_signal| async move { Some(()) }))
     }
 
+    /// Asks the item's monitor to re-read every property and the menu.
+    ///
+    /// Used when an app registers an item that is already shown: the registration is not
+    /// rebuilt, but the app may have changed its properties without signalling (e.g. a
+    /// libappindicator app that recreated its indicator at the same path), so the shown
+    /// values are refreshed instead.
+    pub(crate) fn request_resync(&self) {
+        self.refresh.request(PendingRefresh::ALL);
+    }
+
     /// Parse a service identifier into service name and object path.
     ///
     /// Handles two formats:
@@ -741,6 +754,7 @@ impl TrayItem {
         Self {
             zbus_connection: connection,
             cancellation_token,
+            refresh: Arc::default(),
             bus_name: Property::new(service),
             id: Property::new(props.id),
             title: Property::new(props.title),

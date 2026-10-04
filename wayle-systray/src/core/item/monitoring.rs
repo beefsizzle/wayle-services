@@ -64,10 +64,19 @@ impl ModelMonitoring for TrayItem {
             .await?;
 
         let cancel_token = cancellation_token.clone();
+        let pending = Arc::clone(&self.refresh);
         let weak_self = Arc::downgrade(&self);
 
         tokio::spawn(async move {
-            monitor_properties(&bus_name, weak_self, item_proxy, menu_proxy, cancel_token).await;
+            monitor_properties(
+                &bus_name,
+                weak_self,
+                item_proxy,
+                menu_proxy,
+                pending,
+                cancel_token,
+            )
+            .await;
         });
 
         Ok(())
@@ -78,21 +87,24 @@ impl ModelMonitoring for TrayItem {
 ///
 /// The signal pumps only record *that* something changed; the refresh worker does the
 /// D-Bus round trips. A storm of N identical signals therefore costs one fetch, not N.
-#[derive(Default)]
-struct PendingRefresh {
+/// Each [`TrayItem`] owns one, so the registrar can also ask a live item to re-read
+/// everything (see [`TrayItem::request_resync`]).
+#[derive(Debug, Default)]
+pub(crate) struct PendingRefresh {
     bits: AtomicU8,
     notify: Notify,
 }
 
 impl PendingRefresh {
-    /// Re-read every property and the menu (initial post-subscription sync).
-    const ALL: u8 = 1 << 0;
+    /// Re-read every property and the menu (initial post-subscription sync, or a repeated
+    /// registration of an item that is already shown).
+    pub(crate) const ALL: u8 = 1 << 0;
     const ICON: u8 = 1 << 1;
     const ATTENTION_ICON: u8 = 1 << 2;
     const OVERLAY_ICON: u8 = 1 << 3;
     const MENU: u8 = 1 << 4;
 
-    fn request(&self, bits: u8) {
+    pub(crate) fn request(&self, bits: u8) {
         self.bits.fetch_or(bits, Ordering::AcqRel);
         self.notify.notify_one();
     }
@@ -121,11 +133,11 @@ async fn monitor_properties(
     weak_item: Weak<TrayItem>,
     item_proxy: StatusNotifierItemProxy<'static>,
     menu_proxy: DBusMenuProxy<'static>,
-    cancellation_token: CancellationToken,
+    pending: Arc<PendingRefresh>,
+    item_token: CancellationToken,
 ) {
     // Stops the worker, the debouncer and every pump together.
-    let token = cancellation_token.child_token();
-    let pending = Arc::new(PendingRefresh::default());
+    let token = item_token.child_token();
     let menu_signal = Arc::new(Notify::new());
 
     tokio::spawn(refresh_worker(
