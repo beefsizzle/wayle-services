@@ -31,8 +31,8 @@ impl StatusNotifierWatcher {
         #[zbus(header)] header: Header<'_>,
         service: String,
     ) -> fdo::Result<()> {
-        // The sender is the item's live owning connection — a provably-alive unique name,
-        // so no owner resolution is needed and the register-after-death race is avoided.
+        // The sender owns object-path registrations; for a bus-name service the registrar
+        // resolves the name's owner, which may be another connection of the same app.
         let sender = header
             .sender()
             .and_then(|name| OwnedUniqueName::try_from(name.as_str()).ok());
