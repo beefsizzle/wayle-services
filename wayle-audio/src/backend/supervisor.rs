@@ -132,6 +132,10 @@ impl Default for SupervisorConfig {
 /// exception is a server that keeps dropping connections: a session shorter
 /// than [`SupervisorConfig::stable_session`] counts as a failure, and the
 /// schedule keeps growing until a session stays up that long.
+///
+/// Connection changes are logged at info/warn level the first time; while
+/// the server keeps dropping connections, the repeats are logged at debug
+/// level so a flapping server cannot flood the log.
 pub(crate) async fn supervise<C: Connector>(
     connector: &mut C,
     config: SupervisorConfig,
@@ -150,8 +154,10 @@ pub(crate) async fn supervise<C: Connector>(
 
         match attempt {
             Ok(session) => {
-                if failed_attempts > 0 {
-                    info!(failed_attempts, "Connected to audio server after retrying");
+                if flapping {
+                    debug!(failed_attempts, "Reconnected to audio server");
+                } else {
+                    info!(failed_attempts, "Connected to audio server");
                 }
                 failed_attempts = 0;
                 if !flapping {
@@ -162,9 +168,14 @@ pub(crate) async fn supervise<C: Connector>(
                 match connector.run_session(session, token).await {
                     SessionEnd::Cancelled => return,
                     SessionEnd::Disconnected => {
-                        warn!("Audio server connection lost, reconnecting");
+                        let short = started.elapsed() < config.stable_session;
+                        if flapping && short {
+                            debug!("Audio server connection lost again, reconnecting");
+                        } else {
+                            warn!("Audio server connection lost, reconnecting");
+                        }
                         connector.reset_state();
-                        flapping = started.elapsed() < config.stable_session;
+                        flapping = short;
                         if !flapping {
                             backoff.reset();
                         }
@@ -173,7 +184,7 @@ pub(crate) async fn supervise<C: Connector>(
             }
             Err(err) => {
                 failed_attempts = failed_attempts.saturating_add(1);
-                if failed_attempts == 1 {
+                if failed_attempts == 1 && !flapping {
                     warn!(error = %err, "Cannot connect to audio server, will keep retrying");
                 } else {
                     debug!(error = %err, failed_attempts, "Audio server connection attempt failed");

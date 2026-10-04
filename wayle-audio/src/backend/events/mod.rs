@@ -4,7 +4,7 @@ use libpulse_binding::context::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::debug;
 
 use super::types::{
     ChangeNotification, DeviceStore, EventSender, InternalCommandSender, StreamStore,
@@ -33,7 +33,7 @@ pub(crate) fn start_event_processor(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
-                    info!("Event processor cancelled, stopping");
+                    debug!("Event processor cancelled, stopping");
                     return;
                 }
                 Some(notification) = change_rx.recv() => {
@@ -47,7 +47,7 @@ pub(crate) fn start_event_processor(
                     .await;
                 }
                 else => {
-                    info!("Change notification channel closed");
+                    debug!("Change notification channel closed");
                     return;
                 }
             }

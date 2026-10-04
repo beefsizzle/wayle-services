@@ -388,7 +388,7 @@ impl PulseBackend {
         let (internal_command_tx, internal_command_rx) =
             mpsc::unbounded_channel::<InternalRefresh>();
 
-        info!("Setting up PulseAudio event subscription");
+        debug!("Setting up PulseAudio event subscription");
         let event_handle = events::start_event_processor(
             &mut connection.context,
             self.state.devices.clone(),
@@ -398,7 +398,7 @@ impl PulseBackend {
             session_token,
         )?;
 
-        info!("Triggering initial device and stream discovery");
+        debug!("Triggering initial device and stream discovery");
         let _ = internal_command_tx.send(InternalRefresh::Devices);
         let _ = internal_command_tx.send(InternalRefresh::Streams);
         let _ = internal_command_tx.send(InternalRefresh::ServerInfo);
@@ -475,7 +475,7 @@ impl Connector for PulseBackend {
                 }
             };
 
-        info!("PulseAudio backend fully initialized and monitoring");
+        debug!("PulseAudio backend fully initialized and monitoring");
         self.gate.set_connected(true);
 
         // The context can fail without the mainloop tick reporting any work,
@@ -490,7 +490,8 @@ impl Connector for PulseBackend {
         let end = loop {
             let state = connection.context.get_state();
             if state != ContextState::Ready {
-                warn!(?state, "PulseAudio context is no longer usable");
+                // The supervisor reports the lost connection.
+                debug!(?state, "PulseAudio context is no longer usable");
                 break SessionEnd::Disconnected;
             }
 
@@ -545,7 +546,9 @@ impl Connector for PulseBackend {
         // resets state, so no notification from this connection can touch
         // the stores after they are cleared or repopulated by the next one.
         session_token.cancel();
-        let _ = event_handle.await;
+        if let Err(err) = event_handle.await {
+            warn!(error = %err, "PulseAudio event processor task failed");
+        }
         drop(connection);
 
         end
