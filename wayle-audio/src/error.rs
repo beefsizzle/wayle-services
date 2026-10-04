@@ -64,6 +64,13 @@ pub enum Error {
     #[error("not connected to the audio server")]
     NotConnected,
 
+    /// The volume has a channel count PulseAudio cannot represent.
+    #[error("volume has {channels} channels, expected 1 to 32")]
+    InvalidChannelCount {
+        /// Number of channels in the rejected volume.
+        channels: usize,
+    },
+
     /// Lock poisoned due to panic in another thread.
     #[error("shared data lock poisoned")]
     LockPoisoned,

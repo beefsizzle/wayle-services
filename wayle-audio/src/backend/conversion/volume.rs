@@ -1,6 +1,23 @@
-use libpulse_binding::volume::{ChannelVolumes, Volume as PulseVolume};
+use libpulse_binding::{
+    channelmap::Map,
+    volume::{ChannelVolumes, Volume as PulseVolume},
+};
 
-use crate::volume::types::Volume;
+use crate::{error::Error, volume::types::Volume};
+
+/// Converts `volume` for a libpulse request.
+///
+/// libpulse rejects volumes without channels (the request comes back as a
+/// null operation, which libpulse-binding turns into a panic) and aborts the
+/// process on more than [`Map::CHANNELS_MAX`] channels, so those are refused
+/// here.
+pub(crate) fn to_pulse_checked(volume: &Volume) -> Result<ChannelVolumes, Error> {
+    let channels = volume.channels();
+    if channels == 0 || channels > usize::from(Map::CHANNELS_MAX) {
+        return Err(Error::InvalidChannelCount { channels });
+    }
+    Ok(to_pulse(volume))
+}
 
 pub(crate) fn to_pulse(volume: &Volume) -> ChannelVolumes {
     let channels = volume.channels();
@@ -37,6 +54,22 @@ pub(super) fn from_pulse_single(pulse_volume: PulseVolume) -> Volume {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_conversion_refuses_unrepresentable_channel_counts() {
+        for channels in [0, 33, 256] {
+            let result = to_pulse_checked(&Volume::new(vec![0.5; channels]));
+            assert!(
+                matches!(result, Err(Error::InvalidChannelCount { channels: c }) if c == channels),
+                "{channels} channels: {result:?}"
+            );
+        }
+        for channels in [1, 2, 32] {
+            let result = to_pulse_checked(&Volume::new(vec![0.5; channels])).unwrap();
+            assert!(result.is_valid());
+            assert_eq!(usize::from(result.len()), channels);
+        }
+    }
 
     #[test]
     fn empty_channels_returns_default() {

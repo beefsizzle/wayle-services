@@ -14,7 +14,7 @@ use std::{
 };
 
 use commands::Command;
-use conversion::volume::to_pulse as convert_volume_to_pulse;
+use conversion::volume::to_pulse_checked;
 use dispatcher::{ensure_ready, handle_external_command, handle_internal_command};
 use libpulse_binding::context::{Context, FlagSet as ContextFlags, State as ContextState};
 use supervisor::{Connector, SessionEnd, SupervisorConfig, supervise};
@@ -307,13 +307,12 @@ impl PulseBackend {
                 device,
                 volume,
                 responder,
-            } => gate.submit(
-                Mutation::SetDeviceVolume {
-                    device,
-                    volume: convert_volume_to_pulse(&volume),
-                },
-                responder,
-            ),
+            } => match to_pulse_checked(&volume) {
+                Ok(volume) => gate.submit(Mutation::SetDeviceVolume { device, volume }, responder),
+                Err(err) => {
+                    let _ = responder.send(Err(err));
+                }
+            },
             Command::SetMute {
                 device,
                 muted,
@@ -323,13 +322,12 @@ impl PulseBackend {
                 stream,
                 volume,
                 responder,
-            } => gate.submit(
-                Mutation::SetStreamVolume {
-                    stream,
-                    volume: convert_volume_to_pulse(&volume),
-                },
-                responder,
-            ),
+            } => match to_pulse_checked(&volume) {
+                Ok(volume) => gate.submit(Mutation::SetStreamVolume { stream, volume }, responder),
+                Err(err) => {
+                    let _ = responder.send(Err(err));
+                }
+            },
             Command::SetStreamMute {
                 stream,
                 muted,
@@ -942,7 +940,7 @@ mod tests {
         // libpulse-binding (null operation); the guard must refuse first.
         let mutation = Mutation::SetDeviceVolume {
             device: device_target(&sink(1), Some(1)),
-            volume: convert_volume_to_pulse(&Volume::stereo(0.5, 0.5)),
+            volume: to_pulse_checked(&Volume::stereo(0.5, 0.5)).unwrap(),
         };
         let result =
             handle_external_command(&mut context, mutation, &state.devices, &state.streams);
