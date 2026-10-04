@@ -128,8 +128,11 @@ pub struct OutputDevice {
 }
 
 impl PartialEq for OutputDevice {
+    /// Handles are equal when they refer to the same appearance of the same
+    /// device, so a handle replaced after its index was reused compares unequal
+    /// and is published as a change.
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.key == other.key && self.instance == other.instance
     }
 }
 

@@ -254,8 +254,12 @@ mod tests {
 
     fn create_test_stream(index: u32, stream_type: StreamType) -> Arc<AudioStream> {
         let (command_tx, _): (CommandSender, _) = mpsc::unbounded_channel();
+        let stream_info = test_stream_info(index, stream_type);
+        Arc::new(AudioStream::from_info(stream_info, command_tx, None, None))
+    }
 
-        let stream_info = StreamInfo {
+    fn test_stream_info(index: u32, stream_type: StreamType) -> StreamInfo {
+        StreamInfo {
             index,
             instance: 0,
             stream_type,
@@ -293,9 +297,7 @@ mod tests {
             resample_method: None,
             driver: String::from("test"),
             format: None,
-        };
-
-        Arc::new(AudioStream::from_info(stream_info, command_tx, None, None))
+        }
     }
 
     #[test]
@@ -346,6 +348,27 @@ mod tests {
 
         assert_eq!(playback.get().len(), 1);
         assert_eq!(recording.get().len(), 2);
+    }
+
+    #[test]
+    fn replaced_handle_with_same_key_is_published() {
+        let old = create_test_stream(1, StreamType::Playback);
+        let mut info = test_stream_info(1, StreamType::Playback);
+        info.instance = old.instance + 1;
+        let (command_tx, _): (CommandSender, _) = mpsc::unbounded_channel();
+        let new = Arc::new(AudioStream::from_info(info, command_tx, None, None));
+        assert_eq!(old.key, new.key);
+
+        let mut streams = HashMap::new();
+        streams.insert(old.key, Arc::clone(&old));
+        let playback = Property::new(Vec::new());
+        let recording = Property::new(Vec::new());
+        update_stream_properties(&streams, &playback, &recording);
+
+        streams.insert(new.key, Arc::clone(&new));
+        update_stream_properties(&streams, &playback, &recording);
+
+        assert!(Arc::ptr_eq(&playback.get()[0], &new));
     }
 
     #[test]
