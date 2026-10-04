@@ -40,6 +40,8 @@ struct ServiceIdentifier<'a> {
 #[derive(Debug, Clone)]
 pub struct TrayItem {
     pub(crate) zbus_connection: Connection,
+    /// Live items only. Cancelled when the item is removed, or by the item itself when
+    /// it can no longer be monitored (its registrar lifecycle then removes it).
     pub(crate) cancellation_token: Option<CancellationToken>,
     /// Refresh work owed to this item, drained by its monitor's refresh worker.
     pub(crate) refresh: Arc<PendingRefresh>,

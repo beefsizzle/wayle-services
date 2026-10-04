@@ -164,7 +164,7 @@ async fn monitor_properties(
 
     match item_proxy.receive_new_icon().await {
         Ok(stream) => spawn_pump(stream, token.clone(), request(PendingRefresh::ICON)),
-        Err(error) => return subscription_failed(&token, &error, "NewIcon"),
+        Err(error) => return subscription_failed(&item_token, &error, "NewIcon"),
     }
     match item_proxy.receive_new_attention_icon().await {
         Ok(stream) => spawn_pump(
@@ -172,23 +172,23 @@ async fn monitor_properties(
             token.clone(),
             request(PendingRefresh::ATTENTION_ICON),
         ),
-        Err(error) => return subscription_failed(&token, &error, "NewAttentionIcon"),
+        Err(error) => return subscription_failed(&item_token, &error, "NewAttentionIcon"),
     }
     match item_proxy.receive_new_overlay_icon().await {
         Ok(stream) => spawn_pump(stream, token.clone(), request(PendingRefresh::OVERLAY_ICON)),
-        Err(error) => return subscription_failed(&token, &error, "NewOverlayIcon"),
+        Err(error) => return subscription_failed(&item_token, &error, "NewOverlayIcon"),
     }
     match item_proxy.receive_new_menu().await {
         Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
-        Err(error) => return subscription_failed(&token, &error, "NewMenu"),
+        Err(error) => return subscription_failed(&item_token, &error, "NewMenu"),
     }
     match menu_proxy.receive_layout_updated().await {
         Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
-        Err(error) => return subscription_failed(&token, &error, "LayoutUpdated"),
+        Err(error) => return subscription_failed(&item_token, &error, "LayoutUpdated"),
     }
     match menu_proxy.receive_items_properties_updated().await {
         Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
-        Err(error) => return subscription_failed(&token, &error, "ItemsPropertiesUpdated"),
+        Err(error) => return subscription_failed(&item_token, &error, "ItemsPropertiesUpdated"),
     }
 
     // `get_live` fetched the properties *before* the subscriptions above existed, so a
@@ -198,9 +198,15 @@ async fn monitor_properties(
     debug!("Tray item '{bus_name}' monitoring started");
 }
 
-fn subscription_failed(token: &CancellationToken, error: &zbus::Error, signal: &str) {
-    error!(error = %error, signal, "cannot subscribe to tray item signal");
-    token.cancel();
+/// Gives up on an item whose signals cannot be watched.
+///
+/// Without its subscriptions the item would sit in the tray frozen, and since a repeated
+/// registration of a live item is absorbed, the app could never fix that by registering
+/// again. Cancelling the item's own token stops its worker and pumps and tells its
+/// registrar lifecycle to remove it, so the app's next registration builds it afresh.
+fn subscription_failed(item_token: &CancellationToken, error: &zbus::Error, signal: &str) {
+    error!(error = %error, signal, "cannot subscribe to tray item signal, dropping the item");
+    item_token.cancel();
 }
 
 /// Drains `stream` for as long as it lives, calling `on_signal` (which must not block or

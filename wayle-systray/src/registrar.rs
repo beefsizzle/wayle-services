@@ -547,6 +547,10 @@ async fn item_lifecycle(
         () = cancel.cancelled() => return,
     };
 
+    // The item cancels its own token when it cannot be monitored (see
+    // `subscription_failed`); `cancel` is its parent, so check that one first.
+    let item_token = item.cancellation_token.clone();
+
     handle.send(RegistrarMsg::Insert {
         id,
         key,
@@ -556,12 +560,19 @@ async fn item_lifecycle(
     });
 
     // Item is live: wait for its owner to vanish or its name to be released (or for a
-    // shutdown/dedup/replace cancel), then ask the registrar to remove it.
-    tokio::select! {
-        () = wait_item_gone(&mut death, name_lost.as_mut(), &owner) => {
-            handle.send(RegistrarMsg::Remove { id });
+    // shutdown/dedup/replace cancel), then ask the registrar to remove it. An item that
+    // gave up on itself is removed too, so the app's next registration rebuilds it.
+    let ended = tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        () = wait_item_gone(&mut death, name_lost.as_mut(), &owner) => true,
+        () = wait_cancelled(item_token.as_ref()) => {
+            debug!(owner = %owner, "tray item stopped monitoring, removing it");
+            true
         }
-        () = cancel.cancelled() => {}
+    };
+    if ended {
+        handle.send(RegistrarMsg::Remove { id });
     }
 }
 
@@ -590,6 +601,13 @@ async fn still_owned(
         return false;
     };
     matches!(dbus.get_name_owner(bus_name).await, Ok(name_owner) if name_owner.as_str() == owner.as_str())
+}
+
+async fn wait_cancelled(token: Option<&CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Resolves once the item is gone: its owner connection disconnected, or (when it
