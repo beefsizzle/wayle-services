@@ -7,10 +7,11 @@ use libpulse_binding::{
     context::subscribe::{Facility, Operation},
     volume::ChannelVolumes,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use super::commands::Command;
 use crate::{
+    error::Error,
     events::AudioEvent,
     types::{
         device::{Device, DeviceKey},
@@ -64,8 +65,28 @@ pub(crate) enum InternalRefresh {
     },
 }
 
+/// Reply channel for a mutation.
+pub(crate) type Responder = oneshot::Sender<Result<(), Error>>;
+
+/// A mutation for the connection loop, with the channel its caller waits on.
+///
+/// The connection loop answers it once the request has been handed to
+/// libpulse, or with [`Error::NotConnected`] if it is dropped because no
+/// connection is available.
 #[derive(Debug)]
-pub(crate) enum ExternalCommand {
+pub(crate) struct ExternalCommand {
+    pub mutation: Mutation,
+    pub responder: Responder,
+}
+
+impl ExternalCommand {
+    pub(crate) fn reply(self, result: Result<(), Error>) {
+        let _ = self.responder.send(result);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum Mutation {
     SetDeviceVolume {
         device_key: DeviceKey,
         volume: ChannelVolumes,

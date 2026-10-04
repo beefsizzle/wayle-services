@@ -2,9 +2,7 @@ use libpulse_binding::context::Context;
 
 use super::{
     commands::{device, server, stream},
-    types::{
-        DefaultDevice, DeviceStore, EventSender, ExternalCommand, InternalRefresh, StreamStore,
-    },
+    types::{DefaultDevice, DeviceStore, EventSender, InternalRefresh, Mutation, StreamStore},
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -44,36 +42,36 @@ pub(super) fn handle_internal_command(
 
 pub(super) fn handle_external_command(
     context: &mut Context,
-    command: ExternalCommand,
+    command: Mutation,
     devices: &DeviceStore,
     streams: &StreamStore,
 ) {
     match command {
-        ExternalCommand::SetDeviceVolume { device_key, volume } => {
+        Mutation::SetDeviceVolume { device_key, volume } => {
             device::set_device_volume(context, device_key, volume, devices);
         }
-        ExternalCommand::SetDeviceMute { device_key, muted } => {
+        Mutation::SetDeviceMute { device_key, muted } => {
             device::set_device_mute(context, device_key, muted, devices);
         }
-        ExternalCommand::SetDefaultInput { device_key } => {
+        Mutation::SetDefaultInput { device_key } => {
             server::set_default_input(context, device_key, devices);
         }
-        ExternalCommand::SetDefaultOutput { device_key } => {
+        Mutation::SetDefaultOutput { device_key } => {
             server::set_default_output(context, device_key, devices);
         }
-        ExternalCommand::SetStreamVolume { stream_key, volume } => {
+        Mutation::SetStreamVolume { stream_key, volume } => {
             stream::set_stream_volume(context, stream_key, volume, streams);
         }
-        ExternalCommand::SetStreamMute { stream_key, muted } => {
+        Mutation::SetStreamMute { stream_key, muted } => {
             stream::set_stream_mute(context, stream_key, muted, streams);
         }
-        ExternalCommand::MoveStream {
+        Mutation::MoveStream {
             stream_key,
             device_key,
         } => {
             stream::move_stream(context, stream_key, device_key, streams);
         }
-        ExternalCommand::SetPort { device_key, port } => {
+        Mutation::SetPort { device_key, port } => {
             device::set_device_port(context, device_key, port, devices);
         }
     }

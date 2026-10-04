@@ -57,6 +57,13 @@ pub enum Error {
     #[error("command channel disconnected")]
     CommandChannelDisconnected,
 
+    /// The audio server is not connected, so the command was not sent.
+    ///
+    /// The service keeps reconnecting in the background; the command can be
+    /// retried once devices reappear.
+    #[error("not connected to the audio server")]
+    NotConnected,
+
     /// Lock poisoned due to panic in another thread.
     #[error("shared data lock poisoned")]
     LockPoisoned,

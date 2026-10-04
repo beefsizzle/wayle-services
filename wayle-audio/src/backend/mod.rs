@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     future::poll_fn,
     mem,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -20,14 +20,14 @@ use libpulse_binding::context::{Context, FlagSet as ContextFlags, State as Conte
 use supervisor::{Connector, SessionEnd, SupervisorConfig, supervise};
 use tokio::{
     runtime::Handle,
-    sync::mpsc,
+    sync::mpsc::{self, error::SendError},
     task::{JoinHandle, spawn, spawn_blocking},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use types::{
     CommandReceiver, DefaultDevice, DeviceStore, EventSender, ExternalCommand, InternalRefresh,
-    StreamStore,
+    Mutation, Responder, StreamStore,
 };
 
 use crate::{Error, events::AudioEvent, tokio_mainloop::TokioMain};
@@ -106,6 +106,67 @@ impl Drop for PulseConnection {
     }
 }
 
+/// Hands mutations to the connection loop, but only while it is connected.
+///
+/// Mutations submitted while disconnected are answered with
+/// [`Error::NotConnected`] straight away instead of being queued: they would
+/// otherwise be applied to whatever server comes up next, or wait for one
+/// indefinitely. The flag and the queue are updated under one lock, so a
+/// mutation is either queued before the loop marks itself disconnected (and
+/// is then rejected by [`reject_pending`]) or rejected here.
+#[derive(Clone)]
+struct CommandGate {
+    connected: Arc<Mutex<bool>>,
+    external_tx: mpsc::UnboundedSender<ExternalCommand>,
+}
+
+impl CommandGate {
+    fn new(external_tx: mpsc::UnboundedSender<ExternalCommand>) -> Self {
+        Self {
+            connected: Arc::new(Mutex::new(false)),
+            external_tx,
+        }
+    }
+
+    fn submit(&self, mutation: Mutation, responder: Responder) {
+        let connected = self
+            .connected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let command = ExternalCommand {
+            mutation,
+            responder,
+        };
+
+        if !*connected {
+            command.reply(Err(Error::NotConnected));
+            return;
+        }
+        if let Err(SendError(command)) = self.external_tx.send(command) {
+            command.reply(Err(Error::NotConnected));
+        }
+    }
+
+    fn set_connected(&self, connected: bool) {
+        *self
+            .connected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = connected;
+    }
+}
+
+/// Answers every queued mutation with [`Error::NotConnected`].
+fn reject_pending(external_rx: &mut mpsc::UnboundedReceiver<ExternalCommand>) {
+    let mut rejected = 0usize;
+    while let Ok(command) = external_rx.try_recv() {
+        command.reply(Err(Error::NotConnected));
+        rejected += 1;
+    }
+    if rejected > 0 {
+        debug!(rejected, "Rejected audio commands, server is not connected");
+    }
+}
+
 /// PulseAudio backend.
 ///
 /// Owns the state that survives reconnects and hands itself to the
@@ -114,6 +175,7 @@ pub(crate) struct PulseBackend {
     state: BackendState,
     event_tx: EventSender,
     external_rx: mpsc::UnboundedReceiver<ExternalCommand>,
+    gate: CommandGate,
     allow_autospawn: bool,
 }
 
@@ -131,11 +193,12 @@ impl PulseBackend {
 
                 let state = BackendState::new();
                 let (external_tx, external_rx) = mpsc::unbounded_channel::<ExternalCommand>();
+                let gate = CommandGate::new(external_tx);
                 let command_token = cancellation_token.child_token();
                 let command_handle = Self::spawn_command_processor(
                     &state,
                     command_rx,
-                    external_tx,
+                    gate.clone(),
                     command_token.clone(),
                 );
 
@@ -143,6 +206,7 @@ impl PulseBackend {
                     state,
                     event_tx,
                     external_rx,
+                    gate,
                     allow_autospawn: true,
                 };
                 supervise(
@@ -166,7 +230,7 @@ impl PulseBackend {
     fn spawn_command_processor(
         state: &BackendState,
         mut command_rx: CommandReceiver,
-        external_tx: mpsc::UnboundedSender<ExternalCommand>,
+        gate: CommandGate,
         cancellation_token: CancellationToken,
     ) -> JoinHandle<()> {
         let devices = state.devices.clone();
@@ -185,7 +249,7 @@ impl PulseBackend {
                             return;
                         };
 
-                        Self::handle_command(command, &devices, &streams, &external_tx);
+                        Self::handle_command(command, &devices, &streams, &gate);
                     }
                 }
             }
@@ -197,7 +261,7 @@ impl PulseBackend {
         command: Command,
         devices: &DeviceStore,
         streams: &StreamStore,
-        external_tx: &mpsc::UnboundedSender<ExternalCommand>,
+        gate: &CommandGate,
     ) {
         match command {
             Command::GetDevice {
@@ -240,92 +304,58 @@ impl PulseBackend {
                 device_key,
                 volume,
                 responder,
-            } => {
-                let pulse_volume = convert_volume_to_pulse(&volume);
-                let _ = external_tx.send(ExternalCommand::SetDeviceVolume {
+            } => gate.submit(
+                Mutation::SetDeviceVolume {
                     device_key,
-                    volume: pulse_volume,
-                });
-                let _ = responder.send(Ok(()));
-            }
+                    volume: convert_volume_to_pulse(&volume),
+                },
+                responder,
+            ),
             Command::SetMute {
                 device_key,
                 muted,
                 responder,
-            } => {
-                let _ = external_tx.send(ExternalCommand::SetDeviceMute { device_key, muted });
-                let _ = responder.send(Ok(()));
-            }
+            } => gate.submit(Mutation::SetDeviceMute { device_key, muted }, responder),
             Command::SetStreamVolume {
                 stream_key,
                 volume,
                 responder,
-            } => {
-                let pulse_volume = convert_volume_to_pulse(&volume);
-                let _ = external_tx.send(ExternalCommand::SetStreamVolume {
+            } => gate.submit(
+                Mutation::SetStreamVolume {
                     stream_key,
-                    volume: pulse_volume,
-                });
-                let _ = responder.send(Ok(()));
-            }
+                    volume: convert_volume_to_pulse(&volume),
+                },
+                responder,
+            ),
             Command::SetStreamMute {
                 stream_key,
                 muted,
                 responder,
-            } => {
-                let _ = external_tx.send(ExternalCommand::SetStreamMute { stream_key, muted });
-                let _ = responder.send(Ok(()));
-            }
+            } => gate.submit(Mutation::SetStreamMute { stream_key, muted }, responder),
             Command::SetDefaultInput {
                 device_key,
                 responder,
-            } => {
-                let _ = external_tx.send(ExternalCommand::SetDefaultInput { device_key });
-                let _ = responder.send(Ok(()));
-            }
+            } => gate.submit(Mutation::SetDefaultInput { device_key }, responder),
             Command::SetDefaultOutput {
                 device_key,
                 responder,
-            } => {
-                let _ = external_tx.send(ExternalCommand::SetDefaultOutput { device_key });
-                let _ = responder.send(Ok(()));
-            }
+            } => gate.submit(Mutation::SetDefaultOutput { device_key }, responder),
             Command::MoveStream {
                 stream_key,
                 device_key,
                 responder,
-            } => {
-                let _ = external_tx.send(ExternalCommand::MoveStream {
+            } => gate.submit(
+                Mutation::MoveStream {
                     stream_key,
                     device_key,
-                });
-                let _ = responder.send(Ok(()));
-            }
+                },
+                responder,
+            ),
             Command::SetPort {
                 device_key,
                 port,
                 responder,
-            } => {
-                let _ = external_tx.send(ExternalCommand::SetPort { device_key, port });
-                let _ = responder.send(Ok(()));
-            }
-        }
-    }
-
-    /// Discards mutations queued while no connection was available.
-    ///
-    /// They refer to device and stream indices of a previous server
-    /// instance, which may now name different objects.
-    fn discard_stale_commands(&mut self) {
-        let mut discarded = 0usize;
-        while self.external_rx.try_recv().is_ok() {
-            discarded += 1;
-        }
-        if discarded > 0 {
-            debug!(
-                discarded,
-                "Dropped audio commands issued while disconnected"
-            );
+            } => gate.submit(Mutation::SetPort { device_key, port }, responder),
         }
     }
 
@@ -412,7 +442,7 @@ impl Connector for PulseBackend {
         mut connection: PulseConnection,
         cancellation_token: &CancellationToken,
     ) -> SessionEnd {
-        self.discard_stale_commands();
+        reject_pending(&mut self.external_rx);
 
         let session_token = cancellation_token.child_token();
         let (event_handle, (_internal_tx, mut internal_rx)) =
@@ -425,6 +455,7 @@ impl Connector for PulseBackend {
             };
 
         info!("PulseAudio backend fully initialized and monitoring");
+        self.gate.set_connected(true);
 
         let end = loop {
             tokio::select! {
@@ -460,16 +491,20 @@ impl Connector for PulseBackend {
                     );
                 }
 
-                Some(cmd) = self.external_rx.recv() => {
+                Some(command) = self.external_rx.recv() => {
                     handle_external_command(
                         &mut connection.context,
-                        cmd,
+                        command.mutation,
                         &self.state.devices,
                         &self.state.streams,
                     );
+                    let _ = command.responder.send(Ok(()));
                 }
             }
         };
+
+        self.gate.set_connected(false);
+        reject_pending(&mut self.external_rx);
 
         // Stop this connection's event processor before the supervisor
         // resets state, so no notification from this connection can touch
@@ -697,5 +732,76 @@ mod tests {
             .filter(|event| matches!(event, AudioEvent::DeviceRemoved(_)))
             .count();
         assert_eq!(device_removals, 3);
+    }
+
+    fn submit(gate: &CommandGate) -> tokio::sync::oneshot::Receiver<Result<(), Error>> {
+        let mutation = Mutation::SetDeviceMute {
+            device_key: sink(1).key(),
+            muted: true,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        gate.submit(mutation, tx);
+        rx
+    }
+
+    #[test]
+    fn gate_rejects_commands_while_disconnected() {
+        let (external_tx, mut external_rx) = mpsc::unbounded_channel();
+        let gate = CommandGate::new(external_tx);
+
+        let mut reply = submit(&gate);
+
+        assert!(matches!(reply.try_recv(), Ok(Err(Error::NotConnected))));
+        assert!(external_rx.try_recv().is_err(), "nothing may be queued");
+    }
+
+    #[test]
+    fn gate_forwards_commands_while_connected() {
+        let (external_tx, mut external_rx) = mpsc::unbounded_channel();
+        let gate = CommandGate::new(external_tx);
+        gate.set_connected(true);
+
+        let mut reply = submit(&gate);
+
+        let command = external_rx.try_recv().unwrap();
+        assert!(matches!(
+            command.mutation,
+            Mutation::SetDeviceMute { muted: true, .. }
+        ));
+        assert!(
+            reply.try_recv().is_err(),
+            "reply comes from the connection loop"
+        );
+        command.reply(Ok(()));
+        assert!(matches!(reply.try_recv(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn commands_queued_before_disconnect_are_rejected() {
+        let (external_tx, mut external_rx) = mpsc::unbounded_channel();
+        let gate = CommandGate::new(external_tx);
+        gate.set_connected(true);
+        let mut first = submit(&gate);
+        let mut second = submit(&gate);
+
+        gate.set_connected(false);
+        reject_pending(&mut external_rx);
+
+        assert!(matches!(first.try_recv(), Ok(Err(Error::NotConnected))));
+        assert!(matches!(second.try_recv(), Ok(Err(Error::NotConnected))));
+        let mut late = submit(&gate);
+        assert!(matches!(late.try_recv(), Ok(Err(Error::NotConnected))));
+    }
+
+    #[test]
+    fn gate_rejects_when_connection_loop_is_gone() {
+        let (external_tx, external_rx) = mpsc::unbounded_channel();
+        let gate = CommandGate::new(external_tx);
+        gate.set_connected(true);
+        drop(external_rx);
+
+        let mut reply = submit(&gate);
+
+        assert!(matches!(reply.try_recv(), Ok(Err(Error::NotConnected))));
     }
 }
