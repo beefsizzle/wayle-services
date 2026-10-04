@@ -13,7 +13,7 @@ use wayle_core::Property;
 use zbus::Connection;
 
 use crate::{
-    backend::{AwwwBackend, TransitionConfig, wait_for_daemon},
+    backend::{AwwwBackend, TransitionConfig},
     builder::WallpaperServiceBuilder,
     error::Error,
     types::{ColorExtractorConfig, CyclingConfig, CyclingMode, FitMode, MonitorState},
@@ -394,12 +394,11 @@ impl WallpaperService {
     /// Renders all monitors' wallpapers in a background task.
     ///
     /// State must already be updated via `monitors.set()` before calling this.
-    /// Only the awww rendering runs in the background. Waits for the daemon
-    /// startup thread to signal readiness before attempting the render.
+    /// Only the awww rendering runs in the background. The render itself waits for the
+    /// daemon startup thread, like every other apply.
     pub fn render_all_background(self: &Arc<Self>) {
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            wait_for_daemon().await;
             if let Err(e) = service.rerender_all().await {
                 warn!(error = %e, "background wallpaper render failed");
             }

@@ -1,7 +1,17 @@
 mod daemon;
 mod transition;
 
-use std::{env, io::ErrorKind, path::Path, process::Stdio, sync::OnceLock, time::Duration};
+use std::{
+    env,
+    io::ErrorKind,
+    path::Path,
+    process::Stdio,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Duration,
+};
 
 pub(crate) use daemon::spawn_daemon_if_needed;
 use tokio::{process::Command, sync::Notify};
@@ -13,11 +23,46 @@ pub use transition::{
 
 use crate::{Error, types::FitMode};
 
-static DAEMON_READY: Notify = Notify::const_new();
+const DAEMON_IDLE: u8 = 0;
+const DAEMON_STARTING: u8 = 1;
+const DAEMON_SETTLED: u8 = 2;
 
-/// Waits until the daemon startup thread signals readiness (or 10s timeout).
+const DAEMON_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Lifecycle of the startup thread. `SETTLED` means it finished, whether or not the daemon
+/// came up; callers then proceed and surface the real error from the client.
+static DAEMON_STATE: AtomicU8 = AtomicU8::new(DAEMON_IDLE);
+static DAEMON_SETTLED_NOTIFY: Notify = Notify::const_new();
+
+fn mark_daemon_starting() {
+    DAEMON_STATE.store(DAEMON_STARTING, Ordering::Release);
+}
+
+fn mark_daemon_settled() {
+    DAEMON_STATE.store(DAEMON_SETTLED, Ordering::Release);
+    DAEMON_SETTLED_NOTIFY.notify_waiters();
+}
+
+/// Waits while the daemon startup thread is running (up to 10s).
+///
+/// Returns immediately once the thread has finished, or if it was never started. Any number
+/// of callers may wait, and late callers see the settled state.
 pub(crate) async fn wait_for_daemon() {
-    let _ = tokio::time::timeout(Duration::from_secs(10), DAEMON_READY.notified()).await;
+    let settled = async {
+        loop {
+            let notified = DAEMON_SETTLED_NOTIFY.notified();
+            tokio::pin!(notified);
+            // Register before re-checking so a notify between check and await isn't lost.
+            notified.as_mut().enable();
+
+            if DAEMON_STATE.load(Ordering::Acquire) != DAEMON_STARTING {
+                return;
+            }
+            notified.await;
+        }
+    };
+
+    let _ = tokio::time::timeout(DAEMON_WAIT_TIMEOUT, settled).await;
 }
 
 static CLIENT_BINARY: OnceLock<&str> = OnceLock::new();
@@ -74,6 +119,8 @@ impl AwwwBackend {
         monitor: Option<&str>,
         transition: &TransitionConfig,
     ) -> Result<(), Error> {
+        wait_for_daemon().await;
+
         let resize_mode = match fit_mode {
             FitMode::Fill => "crop",
             FitMode::Fit => "fit",
@@ -132,5 +179,63 @@ fn apply_transition_args(cmd: &mut Command, config: &TransitionConfig) {
 
     for (flag, value) in config.transition_type.cli_args() {
         cmd.args([flag, &value]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::{
+        sync::{Mutex, MutexGuard},
+        time::{Instant, sleep, timeout},
+    };
+
+    use super::*;
+
+    /// The readiness state is process-global, so tests that touch it must not interleave.
+    static SERIAL: Mutex<()> = Mutex::const_new(());
+
+    async fn serial() -> MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_daemon_was_never_started() {
+        let _guard = serial().await;
+        DAEMON_STATE.store(DAEMON_IDLE, Ordering::Release);
+
+        let started = Instant::now();
+        wait_for_daemon().await;
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_after_startup_settled() {
+        let _guard = serial().await;
+        mark_daemon_starting();
+        mark_daemon_settled();
+
+        let started = Instant::now();
+        wait_for_daemon().await;
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn every_waiter_is_released_when_startup_settles() {
+        let _guard = serial().await;
+        mark_daemon_starting();
+
+        let waiters: Vec<_> = (0..3).map(|_| tokio::spawn(wait_for_daemon())).collect();
+
+        sleep(Duration::from_millis(100)).await;
+        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+
+        mark_daemon_settled();
+
+        for waiter in waiters {
+            let released = timeout(Duration::from_secs(2), waiter).await;
+            assert!(matches!(released, Ok(Ok(()))));
+        }
     }
 }

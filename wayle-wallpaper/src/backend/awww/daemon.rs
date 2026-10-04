@@ -15,9 +15,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Spawns the wallpaper daemon in the background if not already running.
 ///
 /// Prefers `awww-daemon`, falling back to `swww-daemon` if awww is not
-/// installed. Polls until the daemon is accepting commands, then signals
-/// readiness via [`super::DAEMON_READY`].
+/// installed. Polls until the daemon is accepting commands, then marks startup as settled so
+/// [`super::wait_for_daemon`] callers proceed.
 pub fn spawn_daemon_if_needed() {
+    super::mark_daemon_starting();
     thread::spawn(ensure_daemon_ready);
 }
 
@@ -28,7 +29,7 @@ fn ensure_daemon_ready() {
         wait_until_ready(daemon);
     }
 
-    super::DAEMON_READY.notify_one();
+    super::mark_daemon_settled();
 }
 
 #[allow(clippy::cognitive_complexity)]
