@@ -107,8 +107,11 @@ impl PendingRefresh {
     const ATTENTION_ICON: u8 = 1 << 2;
     const OVERLAY_ICON: u8 = 1 << 3;
     const MENU: u8 = 1 << 4;
-    /// Every bit served by reading the item's properties (as opposed to its menu).
-    const PROPERTIES: u8 = Self::ALL | Self::ICON | Self::ATTENTION_ICON | Self::OVERLAY_ICON;
+    const TITLE: u8 = 1 << 5;
+    const TOOLTIP: u8 = 1 << 6;
+    const STATUS: u8 = 1 << 7;
+    /// Every bit served by reading the item's properties (that is, all but the menu).
+    const PROPERTIES: u8 = !Self::MENU;
 
     pub(crate) fn request(&self, bits: u8) {
         self.bits.fetch_or(bits, Ordering::AcqRel);
@@ -159,42 +162,14 @@ async fn monitor_properties(
         token.clone(),
     ));
 
-    let request = |bits: u8| {
-        let pending = Arc::clone(&pending);
-        move || pending.request(bits)
+    let subscriptions = Subscriptions {
+        pending: Arc::clone(&pending),
+        menu_signal,
+        token,
+        item_token,
     };
-    let menu_changed = || {
-        let menu_signal = Arc::clone(&menu_signal);
-        move || menu_signal.notify_one()
-    };
-
-    match item_proxy.receive_new_icon().await {
-        Ok(stream) => spawn_pump(stream, token.clone(), request(PendingRefresh::ICON)),
-        Err(error) => return subscription_failed(&item_token, &error, "NewIcon"),
-    }
-    match item_proxy.receive_new_attention_icon().await {
-        Ok(stream) => spawn_pump(
-            stream,
-            token.clone(),
-            request(PendingRefresh::ATTENTION_ICON),
-        ),
-        Err(error) => return subscription_failed(&item_token, &error, "NewAttentionIcon"),
-    }
-    match item_proxy.receive_new_overlay_icon().await {
-        Ok(stream) => spawn_pump(stream, token.clone(), request(PendingRefresh::OVERLAY_ICON)),
-        Err(error) => return subscription_failed(&item_token, &error, "NewOverlayIcon"),
-    }
-    match item_proxy.receive_new_menu().await {
-        Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
-        Err(error) => return subscription_failed(&item_token, &error, "NewMenu"),
-    }
-    match menu_proxy.receive_layout_updated().await {
-        Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
-        Err(error) => return subscription_failed(&item_token, &error, "LayoutUpdated"),
-    }
-    match menu_proxy.receive_items_properties_updated().await {
-        Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
-        Err(error) => return subscription_failed(&item_token, &error, "ItemsPropertiesUpdated"),
+    if !subscriptions.subscribe_all(&item_proxy, &menu_proxy).await {
+        return;
     }
 
     // `get_live` fetched the properties *before* the subscriptions above existed, so a
@@ -204,15 +179,101 @@ async fn monitor_properties(
     debug!("Tray item '{bus_name}' monitoring started");
 }
 
-/// Gives up on an item whose signals cannot be watched.
-///
-/// Without its subscriptions the item would sit in the tray frozen, and since a repeated
-/// registration of a live item is absorbed, the app could never fix that by registering
-/// again. Cancelling the item's own token stops its worker and pumps and tells its
-/// registrar lifecycle to remove it, so the app's next registration builds it afresh.
-fn subscription_failed(item_token: &CancellationToken, error: &zbus::Error, signal: &str) {
-    error!(error = %error, signal, "cannot subscribe to tray item signal, dropping the item");
-    item_token.cancel();
+/// Creates an item's signal subscriptions, starting each one's pump as soon as it
+/// exists. Each subscription is an `AddMatch` round trip, during which the streams
+/// created before it are already being drained.
+struct Subscriptions {
+    pending: Arc<PendingRefresh>,
+    menu_signal: Arc<Notify>,
+    /// Stops the pumps (and the worker and debouncer) with the item.
+    token: CancellationToken,
+    /// The item's own token, cancelled when a subscription fails.
+    item_token: CancellationToken,
+}
+
+impl Subscriptions {
+    /// Returns `false` (having given up on the item) if any subscription failed.
+    async fn subscribe_all(
+        &self,
+        item: &StatusNotifierItemProxy<'static>,
+        menu: &DBusMenuProxy<'static>,
+    ) -> bool {
+        self.flag(
+            item.receive_new_icon().await,
+            "NewIcon",
+            PendingRefresh::ICON,
+        ) && self.flag(
+            item.receive_new_title().await,
+            "NewTitle",
+            PendingRefresh::TITLE,
+        ) && self.flag(
+            item.receive_new_tool_tip().await,
+            "NewToolTip",
+            PendingRefresh::TOOLTIP,
+        ) && self.flag(
+            item.receive_new_status().await,
+            "NewStatus",
+            PendingRefresh::STATUS,
+        ) && self.flag(
+            item.receive_new_attention_icon().await,
+            "NewAttentionIcon",
+            PendingRefresh::ATTENTION_ICON,
+        ) && self.flag(
+            item.receive_new_overlay_icon().await,
+            "NewOverlayIcon",
+            PendingRefresh::OVERLAY_ICON,
+        ) && self.menu(item.receive_new_menu().await, "NewMenu")
+            && self.menu(menu.receive_layout_updated().await, "LayoutUpdated")
+            && self.menu(
+                menu.receive_items_properties_updated().await,
+                "ItemsPropertiesUpdated",
+            )
+    }
+
+    /// Pumps a signal that asks the worker to re-read the properties in `bits`.
+    fn flag<S>(&self, subscription: zbus::Result<S>, signal: &str, bits: u8) -> bool
+    where
+        S: Stream + Send + 'static,
+    {
+        let pending = Arc::clone(&self.pending);
+        self.pump(subscription, signal, move || pending.request(bits))
+    }
+
+    /// Pumps a menu signal into the debouncer.
+    fn menu<S>(&self, subscription: zbus::Result<S>, signal: &str) -> bool
+    where
+        S: Stream + Send + 'static,
+    {
+        let menu_signal = Arc::clone(&self.menu_signal);
+        self.pump(subscription, signal, move || menu_signal.notify_one())
+    }
+
+    /// Without its subscriptions the item would sit in the tray frozen, and since a
+    /// repeated registration of a live item is absorbed, the app could never fix that by
+    /// registering again. A failure therefore cancels the item's own token, which stops
+    /// its worker and pumps and tells its registrar lifecycle to remove it, so the app's
+    /// next registration builds it afresh.
+    fn pump<S>(
+        &self,
+        subscription: zbus::Result<S>,
+        signal: &str,
+        on_signal: impl Fn() + Send + 'static,
+    ) -> bool
+    where
+        S: Stream + Send + 'static,
+    {
+        match subscription {
+            Ok(stream) => {
+                spawn_pump(stream, self.token.clone(), on_signal);
+                true
+            }
+            Err(error) => {
+                error!(error = %error, signal, "cannot subscribe to tray item signal, dropping the item");
+                self.item_token.cancel();
+                false
+            }
+        }
+    }
 }
 
 /// Drains `stream` for as long as it lives, calling `on_signal` (which must not block or
@@ -345,12 +406,8 @@ fn apply_properties(bits: u8, mut props: HashMap<String, OwnedValue>, tray_item:
 
     if all {
         update(props, "Id", &tray_item.id, |value: String| value);
-        update(props, "Title", &tray_item.title, |value: String| value);
         update(props, "Category", &tray_item.category, |value: String| {
             Category::from(value.as_str())
-        });
-        update(props, "Status", &tray_item.status, |value: String| {
-            Status::from(value.as_str())
         });
         update(props, "WindowId", &tray_item.window_id, |value: i32| value);
         update(
@@ -365,15 +422,28 @@ fn apply_properties(bits: u8, mut props: HashMap<String, OwnedValue>, tray_item:
             &tray_item.icon_theme_path,
             filter_empty,
         );
-        update(props, "ToolTip", &tray_item.tooltip, |value: RawTooltip| {
-            Tooltip::from(value)
-        });
         update(
             props,
             "Menu",
             &tray_item.menu_path,
             |value: OwnedObjectPath| value,
         );
+    }
+
+    if wants(PendingRefresh::TITLE) {
+        update(props, "Title", &tray_item.title, |value: String| value);
+    }
+
+    if wants(PendingRefresh::TOOLTIP) {
+        update(props, "ToolTip", &tray_item.tooltip, |value: RawTooltip| {
+            Tooltip::from(value)
+        });
+    }
+
+    if wants(PendingRefresh::STATUS) {
+        update(props, "Status", &tray_item.status, |value: String| {
+            Status::from(value.as_str())
+        });
     }
 
     if wants(PendingRefresh::ICON) {
