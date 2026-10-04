@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use tokio::time::Instant;
 use tracing::{debug, error, warn};
 use wayle_traits::ServiceMonitoring;
 
@@ -74,6 +75,7 @@ impl ServiceMonitoring for CavaService {
         tokio::spawn(async move {
             let interval_duration = Duration::from_millis(1000 / framerate as u64);
             let mut interval = tokio::time::interval(interval_duration);
+            let mut pacer = TickPacer::new(interval_duration);
 
             loop {
                 tokio::select! {
@@ -98,6 +100,10 @@ impl ServiceMonitoring for CavaService {
                         }
 
                         let new_values = audio_output.values().to_vec();
+                        if let Some(period) = pacer.observe(&new_values) {
+                            debug!(?period, "cava tick period changed");
+                            interval = tokio::time::interval_at(Instant::now() + period, period);
+                        }
                         values.set(new_values);
                     }
                 }
@@ -105,6 +111,69 @@ impl ServiceMonitoring for CavaService {
         });
 
         Ok(())
+    }
+}
+
+/// Bar level at or below which a frame counts as silent. Bars are normalised to
+/// `0.0..=1.0`, so this is well under one pixel on any bar.
+const SILENT_LEVEL: f64 = 1e-3;
+
+/// How long output must stay silent before the loop slows down.
+const SILENCE_GRACE: Duration = Duration::from_secs(2);
+
+/// Tick period while silent. Short enough that bars react to resumed audio
+/// within a frame or two, and well within the capture buffer's capacity.
+const IDLE_PERIOD: Duration = Duration::from_millis(100);
+
+/// Picks the visualization tick period: the configured framerate while there is
+/// sound, and [`IDLE_PERIOD`] once output has been silent for [`SILENCE_GRACE`].
+///
+/// Silent frames produce identical (all-zero) values, so running at the full
+/// framerate only burns wakeups and FFT work while nothing changes on screen.
+struct TickPacer {
+    active: Duration,
+    idle: Duration,
+    grace_ticks: u32,
+    silent_ticks: u32,
+}
+
+impl TickPacer {
+    fn new(active: Duration) -> Self {
+        let grace_ticks = SILENCE_GRACE
+            .as_nanos()
+            .checked_div(active.as_nanos())
+            .and_then(|ticks| u32::try_from(ticks).ok())
+            .unwrap_or(u32::MAX)
+            .max(1);
+
+        Self {
+            active,
+            idle: IDLE_PERIOD.max(active),
+            grace_ticks,
+            silent_ticks: 0,
+        }
+    }
+
+    fn period(&self) -> Duration {
+        if self.silent_ticks >= self.grace_ticks {
+            self.idle
+        } else {
+            self.active
+        }
+    }
+
+    /// Records one frame and returns the new period if it changed.
+    fn observe(&mut self, values: &[f64]) -> Option<Duration> {
+        let before = self.period();
+
+        if values.iter().all(|value| value.abs() <= SILENT_LEVEL) {
+            self.silent_ticks = self.silent_ticks.saturating_add(1);
+        } else {
+            self.silent_ticks = 0;
+        }
+
+        let after = self.period();
+        (after != before).then_some(after)
     }
 }
 
@@ -157,6 +226,76 @@ mod tests {
 
     const MONO_CHANNELS: u32 = 1;
     const STEREO_CHANNELS: u32 = 2;
+
+    const FRAME_60FPS: Duration = Duration::from_millis(16);
+
+    fn feed(pacer: &mut TickPacer, values: &[f64], ticks: u32) -> Vec<Duration> {
+        (0..ticks).filter_map(|_| pacer.observe(values)).collect()
+    }
+
+    #[test]
+    fn pacer_keeps_framerate_while_audible() {
+        let mut pacer = TickPacer::new(FRAME_60FPS);
+
+        let changes = feed(&mut pacer, &[0.0, 0.4, 0.1], 1_000);
+
+        assert!(changes.is_empty());
+        assert_eq!(pacer.period(), FRAME_60FPS);
+    }
+
+    #[test]
+    fn pacer_slows_down_after_silence_grace() {
+        let mut pacer = TickPacer::new(FRAME_60FPS);
+        let grace = pacer.grace_ticks;
+
+        assert!(feed(&mut pacer, &[0.0; 4], grace - 1).is_empty());
+        assert_eq!(pacer.observe(&[0.0; 4]), Some(IDLE_PERIOD));
+        assert!(feed(&mut pacer, &[0.0; 4], 100).is_empty());
+        assert_eq!(pacer.period(), IDLE_PERIOD);
+    }
+
+    #[test]
+    fn pacer_treats_sub_pixel_levels_as_silence() {
+        let mut pacer = TickPacer::new(FRAME_60FPS);
+        let grace = pacer.grace_ticks;
+
+        let changes = feed(&mut pacer, &[SILENT_LEVEL / 2.0; 4], grace);
+
+        assert_eq!(changes, vec![IDLE_PERIOD]);
+    }
+
+    #[test]
+    fn pacer_resumes_framerate_on_first_audible_frame() {
+        let mut pacer = TickPacer::new(FRAME_60FPS);
+        let grace = pacer.grace_ticks;
+        feed(&mut pacer, &[0.0; 4], grace);
+
+        assert_eq!(pacer.observe(&[0.0, 0.2, 0.0, 0.0]), Some(FRAME_60FPS));
+        assert_eq!(pacer.period(), FRAME_60FPS);
+    }
+
+    #[test]
+    fn pacer_silence_counter_restarts_after_sound() {
+        let mut pacer = TickPacer::new(FRAME_60FPS);
+        let grace = pacer.grace_ticks;
+
+        feed(&mut pacer, &[0.0; 4], grace - 1);
+        pacer.observe(&[0.5; 4]);
+
+        assert!(feed(&mut pacer, &[0.0; 4], grace - 1).is_empty());
+        assert_eq!(pacer.period(), FRAME_60FPS);
+    }
+
+    #[test]
+    fn pacer_never_speeds_up_a_slow_framerate() {
+        let slow = Duration::from_millis(500);
+        let mut pacer = TickPacer::new(slow);
+
+        let changes = feed(&mut pacer, &[0.0; 4], 100);
+
+        assert!(changes.is_empty());
+        assert_eq!(pacer.period(), slow);
+    }
 
     #[test]
     fn calculate_cava_buffer_size_with_low_sample_rate_returns_base_multiplier() {
