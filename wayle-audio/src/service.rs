@@ -62,10 +62,11 @@ pub struct AudioService {
 impl AudioService {
     /// Creates a new audio service instance with default configuration.
     ///
-    /// Initializes PulseAudio connection and discovers available devices and streams.
+    /// Connects to PulseAudio in the background (reconnecting if the server is
+    /// unavailable or restarts) and discovers available devices and streams.
     ///
     /// # Errors
-    /// Returns error if PulseAudio connection fails or service initialization fails.
+    /// Returns error if service initialization fails.
     #[instrument]
     pub async fn new() -> Result<Arc<Self>, Error> {
         Self::builder().build().await

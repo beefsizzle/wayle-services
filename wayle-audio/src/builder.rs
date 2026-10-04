@@ -42,12 +42,15 @@ impl AudioServiceBuilder {
 
     /// Builds and initializes the AudioService.
     ///
-    /// This will establish a PulseAudio connection and start monitoring
-    /// for device changes. If `with_daemon()` was called, the service
-    /// will also register on the session bus for external control.
+    /// This starts connecting to PulseAudio in the background and monitors
+    /// for device changes. If the server is not running yet, or restarts
+    /// later, the service keeps reconnecting with backoff; while it is
+    /// disconnected the device and stream lists are empty. If `with_daemon()`
+    /// was called, the service will also register on the session bus for
+    /// external control.
     ///
     /// # Errors
-    /// Returns error if PulseAudio connection fails or monitoring cannot be started.
+    /// Returns error if monitoring cannot be started or D-Bus registration fails.
     pub async fn build(self) -> Result<Arc<AudioService>, Error> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, _) = broadcast::channel(100);
