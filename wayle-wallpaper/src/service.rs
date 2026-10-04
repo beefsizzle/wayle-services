@@ -300,6 +300,12 @@ impl WallpaperService {
         let config = self.color_extractor.get();
         let result = config.extract(&path).await;
 
+        if result.is_err() && self.last_extracted_wallpaper.get().as_ref() == Some(&path) {
+            // Forget the failed path, otherwise the next trigger for the same wallpaper is
+            // deduplicated away and the palette is never retried.
+            self.last_extracted_wallpaper.set(None);
+        }
+
         let _ = self.extraction_complete.send(());
 
         result
