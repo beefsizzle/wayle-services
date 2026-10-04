@@ -14,8 +14,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
+use wayle_core::Property;
 use wayle_traits::ModelMonitoring;
-use zbus::{proxy::CacheProperties, zvariant::OwnedValue};
+use zbus::{
+    proxy::CacheProperties,
+    zvariant::{OwnedObjectPath, OwnedValue},
+};
 
 use super::TrayItem;
 use crate::{
@@ -23,7 +27,7 @@ use crate::{
     proxy::{dbusmenu::DBusMenuProxy, status_notifier_item::StatusNotifierItemProxy},
     types::{
         ITEM_INTERFACE,
-        item::{Category, IconPixmap, RawPixmaps, Status, Tooltip},
+        item::{Category, IconPixmap, RawPixmaps, RawTooltip, Status, Tooltip},
         menu::MenuItem,
     },
 };
@@ -103,6 +107,8 @@ impl PendingRefresh {
     const ATTENTION_ICON: u8 = 1 << 2;
     const OVERLAY_ICON: u8 = 1 << 3;
     const MENU: u8 = 1 << 4;
+    /// Every bit served by reading the item's properties (as opposed to its menu).
+    const PROPERTIES: u8 = Self::ALL | Self::ICON | Self::ATTENTION_ICON | Self::OVERLAY_ICON;
 
     pub(crate) fn request(&self, bits: u8) {
         self.bits.fetch_or(bits, Ordering::AcqRel);
@@ -297,40 +303,22 @@ async fn run_refresh(
     menu_proxy: &DBusMenuProxy<'static>,
     tray_item: &TrayItem,
 ) {
-    if bits & PendingRefresh::ALL != 0 {
-        resync_properties(item_proxy, menu_proxy, tray_item).await;
-        return;
-    }
-
-    if bits & PendingRefresh::ICON != 0 {
-        refresh_icon(item_proxy, tray_item).await;
-    }
-
-    if bits & PendingRefresh::ATTENTION_ICON != 0 {
-        if let Ok(name) = item_proxy.attention_icon_name().await {
-            tray_item.attention_icon_name.set(filter_empty(name));
-        }
-        if let Ok(pixmaps) = item_proxy.attention_icon_pixmap().await {
-            let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-            tray_item.attention_icon_pixmap.set(pixmaps);
+    if bits & PendingRefresh::PROPERTIES != 0 {
+        match fetch_all_properties(item_proxy).await {
+            Ok(props) => apply_properties(bits, props, tray_item),
+            Err(error) => debug!(error = %error, "cannot read tray item properties"),
         }
     }
 
-    if bits & PendingRefresh::OVERLAY_ICON != 0 {
-        if let Ok(name) = item_proxy.overlay_icon_name().await {
-            tray_item.overlay_icon_name.set(filter_empty(name));
-        }
-        if let Ok(pixmaps) = item_proxy.overlay_icon_pixmap().await {
-            let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-            tray_item.overlay_icon_pixmap.set(pixmaps);
-        }
-    }
-
-    if bits & PendingRefresh::MENU != 0 {
+    if bits & (PendingRefresh::ALL | PendingRefresh::MENU) != 0 {
         match menu_proxy.get_layout(0, -1, vec![]).await {
             Ok(layout) => tray_item.menu.set(Some(MenuItem::from(layout))),
             Err(error) if is_timeout(&error) => {
                 debug!(error = %error, "menu layout request timed out, keeping the current menu");
+            }
+            Err(error) if bits & PendingRefresh::ALL != 0 => {
+                // A resync keeps a menu that was read before, as it always has.
+                debug!(error = %error, "cannot read menu layout during resync");
             }
             Err(error) => {
                 tray_item.menu.set(None);
@@ -340,101 +328,119 @@ async fn run_refresh(
     }
 }
 
+/// Writes the properties that `bits` asks for from one `GetAll` reply.
+///
+/// One `GetAll` per batch serves every property signal that arrived since the last batch,
+/// so a resync costs two round trips (this and the menu layout) instead of one per
+/// property. It is also the read that works for every app: libappindicator, for one,
+/// publishes values through `GetAll` that it refuses to return for an individual `Get`.
+///
+/// A property missing from the reply is left as it was, so a reply that lacks it cannot
+/// clobber a value read earlier. The exception is `IconName`: an app that has none (it
+/// only sends pixmaps) omits it, and that must clear a stale name so the pixmap shows.
+fn apply_properties(bits: u8, mut props: HashMap<String, OwnedValue>, tray_item: &TrayItem) {
+    let all = bits & PendingRefresh::ALL != 0;
+    let wants = |bit: u8| all || bits & bit != 0;
+    let props = &mut props;
+
+    if all {
+        update(props, "Id", &tray_item.id, |value: String| value);
+        update(props, "Title", &tray_item.title, |value: String| value);
+        update(props, "Category", &tray_item.category, |value: String| {
+            Category::from(value.as_str())
+        });
+        update(props, "Status", &tray_item.status, |value: String| {
+            Status::from(value.as_str())
+        });
+        update(props, "WindowId", &tray_item.window_id, |value: i32| value);
+        update(
+            props,
+            "ItemIsMenu",
+            &tray_item.item_is_menu,
+            |value: bool| value,
+        );
+        update(
+            props,
+            "IconThemePath",
+            &tray_item.icon_theme_path,
+            filter_empty,
+        );
+        update(props, "ToolTip", &tray_item.tooltip, |value: RawTooltip| {
+            Tooltip::from(value)
+        });
+        update(
+            props,
+            "Menu",
+            &tray_item.menu_path,
+            |value: OwnedObjectPath| value,
+        );
+    }
+
+    if wants(PendingRefresh::ICON) {
+        tray_item
+            .icon_name
+            .set(take_property::<String>(props, "IconName").and_then(filter_empty));
+        update(props, "IconPixmap", &tray_item.icon_pixmap, pixmaps);
+    }
+
+    if wants(PendingRefresh::ATTENTION_ICON) {
+        update(
+            props,
+            "AttentionIconName",
+            &tray_item.attention_icon_name,
+            filter_empty,
+        );
+        update(
+            props,
+            "AttentionIconPixmap",
+            &tray_item.attention_icon_pixmap,
+            pixmaps,
+        );
+        update(
+            props,
+            "AttentionMovieName",
+            &tray_item.attention_movie_name,
+            filter_empty,
+        );
+    }
+
+    if wants(PendingRefresh::OVERLAY_ICON) {
+        update(
+            props,
+            "OverlayIconName",
+            &tray_item.overlay_icon_name,
+            filter_empty,
+        );
+        update(
+            props,
+            "OverlayIconPixmap",
+            &tray_item.overlay_icon_pixmap,
+            pixmaps,
+        );
+    }
+}
+
+/// Sets `property` from the `GetAll` entry `name`, if present and of the expected type.
+fn update<T, V>(
+    props: &mut HashMap<String, OwnedValue>,
+    name: &str,
+    property: &Property<V>,
+    convert: impl FnOnce(T) -> V,
+) where
+    T: TryFrom<OwnedValue>,
+    V: Clone + PartialEq + Send + Sync + 'static,
+{
+    if let Some(value) = take_property::<T>(props, name) {
+        property.set(convert(value));
+    }
+}
+
+fn pixmaps(raw: RawPixmaps) -> Vec<IconPixmap> {
+    raw.into_iter().map(IconPixmap::from).collect()
+}
+
 fn filter_empty(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
-}
-
-/// Re-reads every property once, right after the signal subscriptions are established.
-/// `get_live` fetched these *before* this task subscribed, so a value an app set in that
-/// window was missed and no `*Changed`/`New*` signal will replay it. Each property is
-/// written only when its read succeeds, so a transient error never clobbers a value that
-/// was fetched correctly by `get_live`; if the connection has since died, every read
-/// fails and nothing is overwritten (the item is removed via NameOwnerChanged instead).
-#[allow(clippy::cognitive_complexity)]
-async fn resync_properties(
-    item_proxy: &StatusNotifierItemProxy<'static>,
-    menu_proxy: &DBusMenuProxy<'static>,
-    tray_item: &TrayItem,
-) {
-    if let Ok(value) = item_proxy.id().await {
-        tray_item.id.set(value);
-    }
-    if let Ok(value) = item_proxy.title().await {
-        tray_item.title.set(value);
-    }
-    if let Ok(value) = item_proxy.category().await {
-        tray_item.category.set(Category::from(value.as_str()));
-    }
-    if let Ok(value) = item_proxy.status().await {
-        tray_item.status.set(Status::from(value.as_str()));
-    }
-    if let Ok(value) = item_proxy.window_id().await {
-        tray_item.window_id.set(value);
-    }
-    if let Ok(value) = item_proxy.item_is_menu().await {
-        tray_item.item_is_menu.set(value);
-    }
-    if let Ok(value) = item_proxy.icon_theme_path().await {
-        tray_item.icon_theme_path.set(filter_empty(value));
-    }
-    if let Ok(value) = item_proxy.tool_tip().await {
-        tray_item.tooltip.set(Tooltip::from(value));
-    }
-    if let Ok(value) = item_proxy.menu().await {
-        tray_item.menu_path.set(value);
-    }
-    if let Ok(value) = item_proxy.overlay_icon_name().await {
-        tray_item.overlay_icon_name.set(filter_empty(value));
-    }
-    if let Ok(pixmaps) = item_proxy.overlay_icon_pixmap().await {
-        let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-        tray_item.overlay_icon_pixmap.set(pixmaps);
-    }
-    if let Ok(value) = item_proxy.attention_icon_name().await {
-        tray_item.attention_icon_name.set(filter_empty(value));
-    }
-    if let Ok(pixmaps) = item_proxy.attention_icon_pixmap().await {
-        let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-        tray_item.attention_icon_pixmap.set(pixmaps);
-    }
-    if let Ok(value) = item_proxy.attention_movie_name().await {
-        tray_item.attention_movie_name.set(filter_empty(value));
-    }
-
-    refresh_icon(item_proxy, tray_item).await;
-
-    if let Ok(layout) = menu_proxy.get_layout(0, -1, vec![]).await {
-        tray_item.menu.set(Some(MenuItem::from(layout)));
-    }
-}
-
-/// Reads the item's current icon (name and pixmap) and updates the reactive properties.
-/// Used both for the initial post-subscription sync and in response to `NewIcon` signals.
-///
-/// The read is a single `GetAll` rather than two individual `Get`s. `GetAll` is the only
-/// way to read the icon for apps (e.g. libappindicator-based ones) that publish
-/// `IconName`/`IconPixmap` through `GetAll` yet answer an individual property `Get` with
-/// `UnknownProperty`, so reading those individually would wrongly clear the icon. An
-/// `IconName` missing from the reply means the app genuinely has none (fall back to the
-/// pixmap); a failed call (a vanished or unresponsive peer) leaves the existing values
-/// untouched rather than clobbering them.
-async fn refresh_icon(item_proxy: &StatusNotifierItemProxy<'static>, tray_item: &TrayItem) {
-    let mut props = match fetch_all_properties(item_proxy).await {
-        Ok(props) => props,
-        Err(error) => {
-            debug!(error = %error, "cannot read tray item icon");
-            return;
-        }
-    };
-
-    tray_item
-        .icon_name
-        .set(take_property::<String>(&mut props, "IconName").and_then(filter_empty));
-    if let Some(pixmaps) = take_property::<RawPixmaps>(&mut props, "IconPixmap") {
-        tray_item
-            .icon_pixmap
-            .set(pixmaps.into_iter().map(IconPixmap::from).collect());
-    }
 }
 
 /// Calls `org.freedesktop.DBus.Properties.GetAll` for the item's interface.
