@@ -1,6 +1,10 @@
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicU8, Ordering},
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use futures::{Stream, StreamExt};
@@ -11,25 +15,22 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 use wayle_traits::ModelMonitoring;
-use zbus::proxy::CacheProperties;
+use zbus::{proxy::CacheProperties, zvariant::OwnedValue};
 
 use super::TrayItem;
 use crate::{
     error::Error,
     proxy::{dbusmenu::DBusMenuProxy, status_notifier_item::StatusNotifierItemProxy},
     types::{
-        item::{Category, IconPixmap, Status, Tooltip},
+        ITEM_INTERFACE,
+        item::{Category, IconPixmap, RawPixmaps, Status, Tooltip},
         menu::MenuItem,
     },
 };
 
 const MENU_DEBOUNCE: Duration = Duration::from_millis(100);
 
-const UNKNOWN_PROPERTY_ERROR: &str = "org.freedesktop.DBus.Error.UnknownProperty";
-
-fn is_unknown_property_error(error: &zbus::Error) -> bool {
-    matches!(error, zbus::Error::MethodError(name, _, _) if name.as_str() == UNKNOWN_PROPERTY_ERROR)
-}
+const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 
 impl ModelMonitoring for TrayItem {
     type Error = Error;
@@ -237,7 +238,9 @@ async fn debounce_menu(
 /// Performs the D-Bus fetches requested through `pending`, one batch at a time.
 ///
 /// Runs on its own task so a slow or unresponsive item only delays its own refreshes;
-/// the signal pumps keep draining regardless. Each batch is raced against cancellation,
+/// the signal pumps keep draining regardless. Every call is bounded by the connection's
+/// method timeout, so an item that stops answering delays its refreshes by at most that
+/// long per call and recovers on its own once it answers again. Each batch is raced against cancellation,
 /// so a peer that never answers cannot keep this task alive after the item is removed.
 async fn refresh_worker(
     weak_item: Weak<TrayItem>,
@@ -308,6 +311,9 @@ async fn run_refresh(
     if bits & PendingRefresh::MENU != 0 {
         match menu_proxy.get_layout(0, -1, vec![]).await {
             Ok(layout) => tray_item.menu.set(Some(MenuItem::from(layout))),
+            Err(error) if is_timeout(&error) => {
+                debug!(error = %error, "menu layout request timed out, keeping the current menu");
+            }
             Err(error) => {
                 tray_item.menu.set(None);
                 error!(error = %error, "cannot update menu layout");
@@ -387,41 +393,69 @@ async fn resync_properties(
 /// Reads the item's current icon (name and pixmap) and updates the reactive properties.
 /// Used both for the initial post-subscription sync and in response to `NewIcon` signals.
 ///
-/// The read goes through a *fresh* proxy that eagerly caches via a single `GetAll`, rather
-/// than the caller's non-caching proxy. `GetAll` is the only way to read the icon for apps
-/// (e.g. libappindicator-based ones) that publish `IconName`/`IconPixmap` through `GetAll`
-/// yet answer an individual property `Get` with `UnknownProperty` — reading those
-/// individually would wrongly clear the icon. Rebuilding on each call re-runs `GetAll`, so
-/// the values stay current after a `NewIcon`. A read that fails with `UnknownProperty`
-/// means the app genuinely has no such property (fall back to the pixmap); any other error
-/// (a vanished connection) leaves the existing value untouched rather than clobbering it.
+/// The read is a single `GetAll` rather than two individual `Get`s. `GetAll` is the only
+/// way to read the icon for apps (e.g. libappindicator-based ones) that publish
+/// `IconName`/`IconPixmap` through `GetAll` yet answer an individual property `Get` with
+/// `UnknownProperty`, so reading those individually would wrongly clear the icon. An
+/// `IconName` missing from the reply means the app genuinely has none (fall back to the
+/// pixmap); a failed call (a vanished or unresponsive peer) leaves the existing values
+/// untouched rather than clobbering them.
 async fn refresh_icon(item_proxy: &StatusNotifierItemProxy<'static>, tray_item: &TrayItem) {
-    let inner = item_proxy.inner();
-    let Ok(builder) = StatusNotifierItemProxy::builder(inner.connection())
-        .destination(inner.destination().clone())
-    else {
-        return;
-    };
-    let Ok(builder) = builder.path(inner.path().clone()) else {
-        return;
-    };
-    let Ok(proxy) = builder.cache_properties(CacheProperties::Yes).build().await else {
-        return;
-    };
-
-    match proxy.icon_name().await {
-        Ok(name) => tray_item.icon_name.set(filter_empty(name)),
-        Err(error) if is_unknown_property_error(&error) => tray_item.icon_name.set(None),
-        Err(_) => {}
-    }
-
-    match proxy.icon_pixmap().await {
-        Ok(pixmaps) => {
-            let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-            tray_item.icon_pixmap.set(pixmaps);
+    let mut props = match fetch_all_properties(item_proxy).await {
+        Ok(props) => props,
+        Err(error) => {
+            debug!(error = %error, "cannot read tray item icon");
+            return;
         }
-        Err(_) => {}
+    };
+
+    tray_item
+        .icon_name
+        .set(take_property::<String>(&mut props, "IconName").and_then(filter_empty));
+    if let Some(pixmaps) = take_property::<RawPixmaps>(&mut props, "IconPixmap") {
+        tray_item
+            .icon_pixmap
+            .set(pixmaps.into_iter().map(IconPixmap::from).collect());
     }
+}
+
+/// Calls `org.freedesktop.DBus.Properties.GetAll` for the item's interface.
+///
+/// This goes through [`zbus::Connection::call_method`], so it is bounded by the
+/// connection's method timeout. A caching proxy would not be: zbus populates a property
+/// cache with an untimed `GetAll`, which would let an unresponsive peer park the refresh
+/// worker forever.
+async fn fetch_all_properties(
+    item_proxy: &StatusNotifierItemProxy<'static>,
+) -> zbus::Result<HashMap<String, OwnedValue>> {
+    let inner = item_proxy.inner();
+    let reply = inner
+        .connection()
+        .call_method(
+            Some(inner.destination()),
+            inner.path(),
+            Some(PROPERTIES_INTERFACE),
+            "GetAll",
+            &(ITEM_INTERFACE,),
+        )
+        .await?;
+    reply.body().deserialize()
+}
+
+/// Removes `name` from a `GetAll` reply and converts it, or `None` when the property is
+/// absent or has an unexpected type.
+fn take_property<T>(props: &mut HashMap<String, OwnedValue>, name: &str) -> Option<T>
+where
+    T: TryFrom<OwnedValue>,
+{
+    props.remove(name).and_then(|value| T::try_from(value).ok())
+}
+
+/// `true` when a call failed because the peer did not answer within the connection's
+/// method timeout. Such a failure says nothing about the item's state, so it must never
+/// clear a value that was read successfully before.
+fn is_timeout(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::InputOutput(io) if io.kind() == ErrorKind::TimedOut)
 }
 
 #[cfg(test)]

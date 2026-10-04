@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
@@ -20,6 +20,24 @@ use crate::{
     types::{TrayMode, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH},
     watcher::{StatusNotifierWatcher, discovery::spawn_startup_discovery},
 };
+
+/// Upper bound on any single D-Bus method call made by the service.
+///
+/// Tray items are arbitrary third-party processes, and one that is frozen (or simply never
+/// replies) must not hold a refresh, a click or a CLI request forever. Without a timeout
+/// zbus waits indefinitely. A call that times out fails with
+/// `zbus::Error::InputOutput` of kind [`std::io::ErrorKind::TimedOut`]; callers treat that as
+/// a transient failure and never remove an item because of it (removal is driven only by
+/// the bus reporting that the item's owner or name went away).
+pub(crate) const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Opens a session-bus connection whose method calls are bounded by [`METHOD_TIMEOUT`].
+async fn session_connection() -> Result<Connection, Error> {
+    Ok(zbus::connection::Builder::session()?
+        .method_timeout(METHOD_TIMEOUT)
+        .build()
+        .await?)
+}
 
 /// Builder for configuring a [`SystemTrayService`].
 pub struct SystemTrayServiceBuilder {
@@ -61,7 +79,7 @@ impl SystemTrayServiceBuilder {
     /// Returns an error if D-Bus connection or service initialization fails.
     #[instrument(skip(self), fields(mode = ?self.mode), err)]
     pub async fn build(self) -> Result<Arc<SystemTrayService>, Error> {
-        let connection = Connection::session().await?;
+        let connection = session_connection().await?;
         let cancellation_token = CancellationToken::new();
         let items: Property<Vec<Arc<TrayItem>>> = Property::new(Vec::new());
 
@@ -114,7 +132,7 @@ async fn setup_watcher(
     items: &Property<Vec<Arc<TrayItem>>>,
     cancellation_token: &CancellationToken,
 ) -> Result<Option<Connection>, Error> {
-    let watcher_conn = Connection::session().await?;
+    let watcher_conn = session_connection().await?;
 
     let registrar_token = cancellation_token.child_token();
     let registrar = spawn_registrar(
@@ -170,9 +188,13 @@ async fn setup_host(
     cancellation_token: &CancellationToken,
 ) -> Result<(), Error> {
     // Ensure a watcher actually exists before we try to consume from it.
-    StatusNotifierWatcherProxy::new(connection).await.map_err(|_| {
-        Error::ServiceInitialization("no StatusNotifierWatcher available to connect to".to_string())
-    })?;
+    StatusNotifierWatcherProxy::new(connection)
+        .await
+        .map_err(|_| {
+            Error::ServiceInitialization(
+                "no StatusNotifierWatcher available to connect to".to_string(),
+            )
+        })?;
 
     let host_name = connection
         .unique_name()
@@ -188,7 +210,12 @@ async fn setup_host(
     );
 
     // Start listening before seeding, so no registration that races the seed is lost.
-    spawn_host_listeners(connection, registrar.clone(), cancellation_token.child_token()).await?;
+    spawn_host_listeners(
+        connection,
+        registrar.clone(),
+        cancellation_token.child_token(),
+    )
+    .await?;
     SystemTrayServiceDiscovery::seed_from_watcher(connection, &registrar).await?;
 
     Ok(())
@@ -215,7 +242,9 @@ async fn register_daemon(service: &Arc<SystemTrayService>) -> Result<(), Error> 
         .request_name(SERVICE_NAME)
         .await
         .map_err(|err| {
-            Error::ServiceInitialization(format!("cannot acquire D-Bus name '{SERVICE_NAME}': {err}"))
+            Error::ServiceInitialization(format!(
+                "cannot acquire D-Bus name '{SERVICE_NAME}': {err}"
+            ))
         })?;
 
     info!("System tray service registered at {SERVICE_NAME}");
