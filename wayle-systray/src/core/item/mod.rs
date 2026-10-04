@@ -504,6 +504,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_title_signal(&self) -> Result<impl Stream<Item = ()>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);
@@ -521,6 +529,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_icon_signal(&self) -> Result<impl Stream<Item = ()>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);
@@ -539,6 +555,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_attention_icon_signal(&self) -> Result<impl Stream<Item = ()>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);
@@ -557,6 +581,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_overlay_icon_signal(&self) -> Result<impl Stream<Item = ()>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);
@@ -574,6 +606,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_tool_tip_signal(&self) -> Result<impl Stream<Item = ()>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);
@@ -591,6 +631,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_status_signal(&self) -> Result<impl Stream<Item = Status>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);
@@ -613,6 +661,14 @@ impl TrayItem {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn new_menu_signal(&self) -> Result<impl Stream<Item = ()>, Error> {
         let bus_name = &self.bus_name.get();
         let id = Self::parse_service_identifier(bus_name);

@@ -148,6 +148,14 @@ impl SystemTrayService {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn status_notifier_item_registered_signal(
         &self,
     ) -> Result<impl Stream<Item = String>, Error> {
@@ -165,6 +173,14 @@ impl SystemTrayService {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn status_notifier_item_unregistered_signal(
         &self,
     ) -> Result<impl Stream<Item = String>, Error> {
@@ -181,6 +197,14 @@ impl SystemTrayService {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn status_notifier_host_registered_signal(
         &self,
     ) -> Result<impl Stream<Item = ()>, Error> {
@@ -196,6 +220,14 @@ impl SystemTrayService {
     ///
     /// # Errors
     /// Returns error if D-Bus proxy creation fails.
+    ///
+    /// # Polling
+    ///
+    /// The stream is fed by the service's shared D-Bus connection, which queues at most 64
+    /// unread signals per stream and then stops reading until there is room. Keep polling it
+    /// for as long as you hold it, or drop it: a stream that is held but not polled stalls
+    /// every D-Bus operation of the service (new items, removals, clicks) once 64 signals
+    /// have piled up.
     pub async fn status_notifier_host_unregistered_signal(
         &self,
     ) -> Result<impl Stream<Item = ()>, Error> {
