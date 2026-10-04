@@ -1,6 +1,12 @@
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU8, Ordering},
+};
 
-use tokio::time::{Duration, Instant, sleep};
+use tokio::{
+    sync::Notify,
+    time::{Duration, Instant, sleep},
+};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
@@ -67,7 +73,43 @@ impl ModelMonitoring for TrayItem {
     }
 }
 
-#[allow(clippy::cognitive_complexity)]
+/// Refresh work owed to one tray item, coalesced into a bit set.
+///
+/// The signal loop only records *that* something changed; the refresh worker does the
+/// D-Bus round trips. A storm of N identical signals therefore costs one fetch, not N.
+#[derive(Default)]
+struct PendingRefresh {
+    bits: AtomicU8,
+    notify: Notify,
+}
+
+impl PendingRefresh {
+    /// Re-read every property and the menu (initial post-subscription sync).
+    const ALL: u8 = 1 << 0;
+    const ICON: u8 = 1 << 1;
+    const ATTENTION_ICON: u8 = 1 << 2;
+    const OVERLAY_ICON: u8 = 1 << 3;
+    const MENU: u8 = 1 << 4;
+
+    fn request(&self, bits: u8) {
+        self.bits.fetch_or(bits, Ordering::AcqRel);
+        self.notify.notify_one();
+    }
+
+    fn take(&self) -> u8 {
+        self.bits.swap(0, Ordering::AcqRel)
+    }
+}
+
+/// Drains the item's signal streams and schedules refreshes on a separate worker.
+///
+/// This loop must never await a D-Bus round trip. zbus delivers every incoming message
+/// from a single socket-reader task into bounded per-stream queues (64 messages), and
+/// that reader *waits* when any live stream's queue is full. If this loop awaited a
+/// method reply while the item kept signalling (e.g. a burst of `NewIcon`), the queue
+/// would fill, the reader would stall before reading the reply, and every caller on
+/// the shared connection would hang: no new items, no removals, no clicks, and no
+/// error. So all fetching happens in [`refresh_worker`], and this loop only flags work.
 #[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(bus_name = %bus_name))]
 async fn monitor_properties(
@@ -77,24 +119,6 @@ async fn monitor_properties(
     menu_proxy: DBusMenuProxy<'static>,
     cancellation_token: CancellationToken,
 ) {
-    let mut category_changed = item_proxy.receive_category_changed().await;
-    let mut id_changed = item_proxy.receive_id_changed().await;
-    let mut title_changed = item_proxy.receive_title_changed().await;
-    let mut status_changed = item_proxy.receive_status_changed().await;
-    let mut window_id_changed = item_proxy.receive_window_id_changed().await;
-    let mut icon_name_changed = item_proxy.receive_icon_name_changed().await;
-    let mut icon_pixmap_changed = item_proxy.receive_icon_pixmap_changed().await;
-    let mut overlay_icon_name_changed = item_proxy.receive_overlay_icon_name_changed().await;
-    let mut overlay_icon_pixmap_changed = item_proxy.receive_overlay_icon_pixmap_changed().await;
-    let mut attention_icon_name_changed = item_proxy.receive_attention_icon_name_changed().await;
-    let mut attention_icon_pixmap_changed =
-        item_proxy.receive_attention_icon_pixmap_changed().await;
-    let mut attention_movie_name_changed = item_proxy.receive_attention_movie_name_changed().await;
-    let mut tooltip_changed = item_proxy.receive_tool_tip_changed().await;
-    let mut item_is_menu_changed = item_proxy.receive_item_is_menu_changed().await;
-    let mut menu_changed = item_proxy.receive_menu_changed().await;
-    let mut icon_theme_path_changed = item_proxy.receive_icon_theme_path_changed().await;
-
     let mut new_icon = match item_proxy.receive_new_icon().await {
         Ok(stream) => stream,
         Err(error) => {
@@ -143,24 +167,32 @@ async fn monitor_properties(
         }
     };
 
+    // The worker is stopped when this loop exits for any reason (cancellation, all
+    // streams ended, item dropped), so it never outlives the subscriptions it serves.
+    let worker_token = cancellation_token.child_token();
+    let _stop_worker = worker_token.clone().drop_guard();
+    let pending = Arc::new(PendingRefresh::default());
+
+    // `get_live` fetched the properties *before* the subscriptions above existed, so a
+    // value an app set in that window (common for apps that register first and populate
+    // afterwards) was missed and no signal will replay it. Re-read everything once now.
+    pending.request(PendingRefresh::ALL);
+    tokio::spawn(refresh_worker(
+        weak_item.clone(),
+        item_proxy,
+        menu_proxy,
+        Arc::clone(&pending),
+        worker_token,
+    ));
+
     let mut menu_dirty = false;
     let menu_debounce = sleep(MENU_DEBOUNCE);
     tokio::pin!(menu_debounce);
 
-    // Re-read all properties now that the signal subscriptions above are established.
-    // `get_live` fetched them *before* this monitor task subscribed, so any value an
-    // app set in that window — common for apps that register first and populate
-    // afterwards — emitted its NewIcon/PropertiesChanged into the gap and was missed
-    // (leaving, e.g., the fallback icon or an empty title). Re-reading here closes that
-    // gap; any change after this point is caught by the loop below.
-    if let Some(tray_item) = weak_item.upgrade() {
-        resync_properties(&item_proxy, &menu_proxy, &tray_item).await;
-    }
-
     loop {
-        let Some(tray_item) = weak_item.upgrade() else {
+        if weak_item.strong_count() == 0 {
             return;
-        };
+        }
 
         tokio::select! {
             _ = cancellation_token.cancelled() => {
@@ -169,146 +201,9 @@ async fn monitor_properties(
             }
 
             _ = &mut menu_debounce, if menu_dirty => {
-                debug!("menu debounce fired, fetching layout");
+                debug!("menu debounce fired, scheduling layout fetch");
                 menu_dirty = false;
-
-                match menu_proxy.get_layout(0, -1, vec![]).await {
-                    Ok(layout) => {
-                        let menu_item = MenuItem::from(layout);
-                        tray_item.menu.set(Some(menu_item));
-                    }
-                    Err(error) => {
-                        tray_item.menu.set(None);
-                        error!(error = %error, "cannot update menu layout");
-                    }
-                }
-            }
-
-            Some(change) = category_changed.next() => {
-                if let Ok(new_category) = change.get().await {
-                    let category = Category::from(new_category.as_str());
-                    tray_item.category.set(category);
-                }
-            }
-
-            Some(change) = id_changed.next() => {
-                if let Ok(new_id) = change.get().await {
-                    tray_item.id.set(new_id);
-                }
-            }
-
-            Some(change) = title_changed.next() => {
-                if let Ok(new_title) = change.get().await {
-                    tray_item.title.set(new_title);
-                }
-            }
-
-            Some(change) = status_changed.next() => {
-                if let Ok(new_status) = change.get().await {
-                    let status = Status::from(new_status.as_str());
-                    tray_item.status.set(status);
-                }
-            }
-
-            Some(change) = window_id_changed.next() => {
-                if let Ok(new_window_id) = change.get().await {
-                    tray_item.window_id.set(new_window_id);
-                }
-            }
-
-            Some(change) = icon_name_changed.next() => {
-                if let Ok(new_icon_name) = change.get().await {
-                    let icon_name = if new_icon_name.is_empty() {
-                        None
-                    } else {
-                        Some(new_icon_name)
-                    };
-                    tray_item.icon_name.set(icon_name);
-                }
-            }
-
-            Some(change) = icon_pixmap_changed.next() => {
-                if let Ok(new_pixmaps) = change.get().await {
-                    let pixmaps: Vec<IconPixmap> = new_pixmaps.into_iter().map(Into::into).collect();
-                    tray_item.icon_pixmap.set(pixmaps);
-                }
-            }
-
-            Some(change) = overlay_icon_name_changed.next() => {
-                if let Ok(new_overlay_icon_name) = change.get().await {
-                    let overlay_icon_name = if new_overlay_icon_name.is_empty() {
-                        None
-                    } else {
-                        Some(new_overlay_icon_name)
-                    };
-                    tray_item.overlay_icon_name.set(overlay_icon_name);
-                }
-            }
-
-            Some(change) = overlay_icon_pixmap_changed.next() => {
-                if let Ok(new_pixmaps) = change.get().await {
-                    let pixmaps: Vec<IconPixmap> = new_pixmaps.into_iter().map(Into::into).collect();
-                    tray_item.overlay_icon_pixmap.set(pixmaps);
-                }
-            }
-
-            Some(change) = attention_icon_name_changed.next() => {
-                if let Ok(new_attention_icon_name) = change.get().await {
-                    let attention_icon_name = if new_attention_icon_name.is_empty() {
-                        None
-                    } else {
-                        Some(new_attention_icon_name)
-                    };
-                    tray_item.attention_icon_name.set(attention_icon_name);
-                }
-            }
-
-            Some(change) = attention_icon_pixmap_changed.next() => {
-                if let Ok(new_pixmaps) = change.get().await {
-                    let pixmaps: Vec<IconPixmap> = new_pixmaps.into_iter().map(Into::into).collect();
-                    tray_item.attention_icon_pixmap.set(pixmaps);
-                }
-            }
-
-            Some(change) = attention_movie_name_changed.next() => {
-                if let Ok(new_movie_name) = change.get().await {
-                    let attention_movie_name = if new_movie_name.is_empty() {
-                        None
-                    } else {
-                        Some(new_movie_name)
-                    };
-                    tray_item.attention_movie_name.set(attention_movie_name);
-                }
-            }
-
-            Some(change) = tooltip_changed.next() => {
-                if let Ok(raw_tooltip) = change.get().await {
-                    let tooltip = Tooltip::from(raw_tooltip);
-                    tray_item.tooltip.set(tooltip);
-                }
-            }
-
-            Some(change) = item_is_menu_changed.next() => {
-                if let Ok(new_item_is_menu) = change.get().await {
-                    tray_item.item_is_menu.set(new_item_is_menu);
-                }
-            }
-
-            Some(change) = menu_changed.next() => {
-                if let Ok(new_menu_path) = change.get().await {
-                    tray_item.menu_path.set(new_menu_path);
-                }
-            }
-
-            Some(change) = icon_theme_path_changed.next() => {
-                if let Ok(new_icon_theme_path) = change.get().await {
-                    let icon_theme_path = if new_icon_theme_path.is_empty() {
-                        None
-                    } else {
-                        Some(new_icon_theme_path)
-                    };
-                    tray_item.icon_theme_path.set(icon_theme_path);
-                }
+                pending.request(PendingRefresh::MENU);
             }
 
             Some(_) = new_menu.next() => {
@@ -331,36 +226,102 @@ async fn monitor_properties(
 
             Some(_) = new_icon.next() => {
                 debug!("NewIcon signal received");
-                refresh_icon(&item_proxy, &tray_item).await;
+                pending.request(PendingRefresh::ICON);
             }
 
             Some(_) = new_attention_icon.next() => {
                 debug!("NewAttentionIcon signal received");
-                if let Ok(name) = item_proxy.attention_icon_name().await {
-                    let icon_name = if name.is_empty() { None } else { Some(name) };
-                    tray_item.attention_icon_name.set(icon_name);
-                }
-                if let Ok(pixmaps) = item_proxy.attention_icon_pixmap().await {
-                    let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-                    tray_item.attention_icon_pixmap.set(pixmaps);
-                }
+                pending.request(PendingRefresh::ATTENTION_ICON);
             }
 
             Some(_) = new_overlay_icon.next() => {
                 debug!("NewOverlayIcon signal received");
-                if let Ok(name) = item_proxy.overlay_icon_name().await {
-                    let icon_name = if name.is_empty() { None } else { Some(name) };
-                    tray_item.overlay_icon_name.set(icon_name);
-                }
-                if let Ok(pixmaps) = item_proxy.overlay_icon_pixmap().await {
-                    let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
-                    tray_item.overlay_icon_pixmap.set(pixmaps);
-                }
+                pending.request(PendingRefresh::OVERLAY_ICON);
             }
 
             else => {
-                debug!("All property streams ended for tray item {bus_name}, exiting monitor");
+                debug!("All signal streams ended for tray item {bus_name}, exiting monitor");
                 break;
+            }
+        }
+    }
+}
+
+/// Performs the D-Bus fetches requested through `pending`, one batch at a time.
+///
+/// Runs on its own task so a slow or unresponsive item only delays its own refreshes;
+/// the signal loop keeps draining regardless. Each batch is raced against cancellation,
+/// so a peer that never answers cannot keep this task alive after the item is removed.
+async fn refresh_worker(
+    weak_item: Weak<TrayItem>,
+    item_proxy: StatusNotifierItemProxy<'static>,
+    menu_proxy: DBusMenuProxy<'static>,
+    pending: Arc<PendingRefresh>,
+    cancellation_token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = cancellation_token.cancelled() => return,
+            () = pending.notify.notified() => {}
+        }
+
+        let bits = pending.take();
+        if bits == 0 {
+            continue;
+        }
+        let Some(tray_item) = weak_item.upgrade() else {
+            return;
+        };
+
+        let batch = run_refresh(bits, &item_proxy, &menu_proxy, &tray_item);
+        tokio::select! {
+            () = cancellation_token.cancelled() => return,
+            () = batch => {}
+        }
+    }
+}
+
+async fn run_refresh(
+    bits: u8,
+    item_proxy: &StatusNotifierItemProxy<'static>,
+    menu_proxy: &DBusMenuProxy<'static>,
+    tray_item: &TrayItem,
+) {
+    if bits & PendingRefresh::ALL != 0 {
+        resync_properties(item_proxy, menu_proxy, tray_item).await;
+        return;
+    }
+
+    if bits & PendingRefresh::ICON != 0 {
+        refresh_icon(item_proxy, tray_item).await;
+    }
+
+    if bits & PendingRefresh::ATTENTION_ICON != 0 {
+        if let Ok(name) = item_proxy.attention_icon_name().await {
+            tray_item.attention_icon_name.set(filter_empty(name));
+        }
+        if let Ok(pixmaps) = item_proxy.attention_icon_pixmap().await {
+            let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
+            tray_item.attention_icon_pixmap.set(pixmaps);
+        }
+    }
+
+    if bits & PendingRefresh::OVERLAY_ICON != 0 {
+        if let Ok(name) = item_proxy.overlay_icon_name().await {
+            tray_item.overlay_icon_name.set(filter_empty(name));
+        }
+        if let Ok(pixmaps) = item_proxy.overlay_icon_pixmap().await {
+            let pixmaps: Vec<IconPixmap> = pixmaps.into_iter().map(Into::into).collect();
+            tray_item.overlay_icon_pixmap.set(pixmaps);
+        }
+    }
+
+    if bits & PendingRefresh::MENU != 0 {
+        match menu_proxy.get_layout(0, -1, vec![]).await {
+            Ok(layout) => tray_item.menu.set(Some(MenuItem::from(layout))),
+            Err(error) => {
+                tray_item.menu.set(None);
+                error!(error = %error, "cannot update menu layout");
             }
         }
     }
@@ -447,8 +408,8 @@ async fn resync_properties(
 /// (a vanished connection) leaves the existing value untouched rather than clobbering it.
 async fn refresh_icon(item_proxy: &StatusNotifierItemProxy<'static>, tray_item: &TrayItem) {
     let inner = item_proxy.inner();
-    let Ok(builder) =
-        StatusNotifierItemProxy::builder(inner.connection()).destination(inner.destination().clone())
+    let Ok(builder) = StatusNotifierItemProxy::builder(inner.connection())
+        .destination(inner.destination().clone())
     else {
         return;
     };
@@ -471,5 +432,53 @@ async fn refresh_icon(item_proxy: &StatusNotifierItemProxy<'static>, tray_item: 
             tray_item.icon_pixmap.set(pixmaps);
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn pending_refresh_coalesces_repeated_requests() {
+        let pending = PendingRefresh::default();
+
+        for _ in 0..300 {
+            pending.request(PendingRefresh::ICON);
+        }
+        pending.request(PendingRefresh::MENU);
+
+        assert_eq!(pending.take(), PendingRefresh::ICON | PendingRefresh::MENU);
+        assert_eq!(pending.take(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_wakes_worker_requested_before_it_waits() {
+        let pending = PendingRefresh::default();
+
+        // A request that lands while the worker is busy must not be lost: the
+        // permit is stored and the next `notified()` resolves immediately.
+        pending.request(PendingRefresh::ICON);
+        let woke = tokio::time::timeout(Duration::from_secs(1), pending.notify.notified()).await;
+
+        assert!(woke.is_ok());
+        assert_eq!(pending.take(), PendingRefresh::ICON);
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_storm_yields_single_wakeup() {
+        let pending = PendingRefresh::default();
+
+        for _ in 0..300 {
+            pending.request(PendingRefresh::ICON);
+        }
+        pending.notify.notified().await;
+        let _ = pending.take();
+        let second =
+            tokio::time::timeout(Duration::from_millis(50), pending.notify.notified()).await;
+
+        assert!(second.is_err());
     }
 }
