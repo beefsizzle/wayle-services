@@ -3,11 +3,11 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
+use futures::{Stream, StreamExt};
 use tokio::{
     sync::Notify,
-    time::{Duration, Instant, sleep},
+    time::{Duration, sleep},
 };
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 use wayle_traits::ModelMonitoring;
@@ -75,7 +75,7 @@ impl ModelMonitoring for TrayItem {
 
 /// Refresh work owed to one tray item, coalesced into a bit set.
 ///
-/// The signal loop only records *that* something changed; the refresh worker does the
+/// The signal pumps only record *that* something changed; the refresh worker does the
 /// D-Bus round trips. A storm of N identical signals therefore costs one fetch, not N.
 #[derive(Default)]
 struct PendingRefresh {
@@ -101,16 +101,19 @@ impl PendingRefresh {
     }
 }
 
-/// Drains the item's signal streams and schedules refreshes on a separate worker.
+/// Subscribes to the item's signals and turns each one into a refresh request.
 ///
-/// This loop must never await a D-Bus round trip. zbus delivers every incoming message
-/// from a single socket-reader task into bounded per-stream queues (64 messages), and
-/// that reader *waits* when any live stream's queue is full. If this loop awaited a
-/// method reply while the item kept signalling (e.g. a burst of `NewIcon`), the queue
-/// would fill, the reader would stall before reading the reply, and every caller on
-/// the shared connection would hang: no new items, no removals, no clicks, and no
-/// error. So all fetching happens in [`refresh_worker`], and this loop only flags work.
-#[allow(clippy::too_many_lines)]
+/// Nothing that holds one of these signal streams may stop polling it to await a D-Bus
+/// round trip. zbus delivers every incoming message from a single socket-reader task
+/// into bounded per-stream queues (64 messages), and that reader *waits* when any live
+/// stream's queue is full. If a stream sat unpolled while its item kept signalling (a
+/// burst of `NewIcon`, say) and the holder was waiting for a reply queued behind those
+/// signals, the reader would stall for good and every caller on the shared connection
+/// would hang: no new items, no removals, no clicks, and no error.
+///
+/// So each stream gets its own pump task the moment it exists (setting up the next
+/// subscription is itself a round trip), pumps only flag work, and [`refresh_worker`]
+/// does all the fetching.
 #[instrument(skip_all, fields(bus_name = %bus_name))]
 async fn monitor_properties(
     bus_name: &str,
@@ -119,138 +122,122 @@ async fn monitor_properties(
     menu_proxy: DBusMenuProxy<'static>,
     cancellation_token: CancellationToken,
 ) {
-    let mut new_icon = match item_proxy.receive_new_icon().await {
-        Ok(stream) => stream,
-        Err(error) => {
-            error!(error = %error, "cannot subscribe to NewIcon signal");
-            return;
-        }
-    };
-
-    let mut new_attention_icon = match item_proxy.receive_new_attention_icon().await {
-        Ok(stream) => stream,
-        Err(error) => {
-            error!(error = %error, "cannot subscribe to NewAttentionIcon signal");
-            return;
-        }
-    };
-
-    let mut new_overlay_icon = match item_proxy.receive_new_overlay_icon().await {
-        Ok(stream) => stream,
-        Err(error) => {
-            error!(error = %error, "cannot subscribe to NewOverlayIcon signal");
-            return;
-        }
-    };
-
-    let mut new_menu = match item_proxy.receive_new_menu().await {
-        Ok(stream) => stream,
-        Err(error) => {
-            error!(error = %error, "cannot subscribe to NewMenu signal");
-            return;
-        }
-    };
-
-    let mut layout_updated = match menu_proxy.receive_layout_updated().await {
-        Ok(layout) => layout,
-        Err(error) => {
-            error!(error = %error, "cannot subscribe to menu layout updates");
-            return;
-        }
-    };
-
-    let mut items_properties_updated = match menu_proxy.receive_items_properties_updated().await {
-        Ok(stream) => stream,
-        Err(error) => {
-            error!(error = %error, "cannot subscribe to menu items properties updates");
-            return;
-        }
-    };
-
-    // The worker is stopped when this loop exits for any reason (cancellation, all
-    // streams ended, item dropped), so it never outlives the subscriptions it serves.
-    let worker_token = cancellation_token.child_token();
-    let _stop_worker = worker_token.clone().drop_guard();
+    // Stops the worker, the debouncer and every pump together.
+    let token = cancellation_token.child_token();
     let pending = Arc::new(PendingRefresh::default());
+    let menu_signal = Arc::new(Notify::new());
+
+    tokio::spawn(refresh_worker(
+        weak_item,
+        item_proxy.clone(),
+        menu_proxy.clone(),
+        Arc::clone(&pending),
+        token.clone(),
+    ));
+    tokio::spawn(debounce_menu(
+        Arc::clone(&menu_signal),
+        Arc::clone(&pending),
+        token.clone(),
+    ));
+
+    let request = |bits: u8| {
+        let pending = Arc::clone(&pending);
+        move || pending.request(bits)
+    };
+    let menu_changed = || {
+        let menu_signal = Arc::clone(&menu_signal);
+        move || menu_signal.notify_one()
+    };
+
+    match item_proxy.receive_new_icon().await {
+        Ok(stream) => spawn_pump(stream, token.clone(), request(PendingRefresh::ICON)),
+        Err(error) => return subscription_failed(&token, &error, "NewIcon"),
+    }
+    match item_proxy.receive_new_attention_icon().await {
+        Ok(stream) => spawn_pump(
+            stream,
+            token.clone(),
+            request(PendingRefresh::ATTENTION_ICON),
+        ),
+        Err(error) => return subscription_failed(&token, &error, "NewAttentionIcon"),
+    }
+    match item_proxy.receive_new_overlay_icon().await {
+        Ok(stream) => spawn_pump(stream, token.clone(), request(PendingRefresh::OVERLAY_ICON)),
+        Err(error) => return subscription_failed(&token, &error, "NewOverlayIcon"),
+    }
+    match item_proxy.receive_new_menu().await {
+        Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
+        Err(error) => return subscription_failed(&token, &error, "NewMenu"),
+    }
+    match menu_proxy.receive_layout_updated().await {
+        Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
+        Err(error) => return subscription_failed(&token, &error, "LayoutUpdated"),
+    }
+    match menu_proxy.receive_items_properties_updated().await {
+        Ok(stream) => spawn_pump(stream, token.clone(), menu_changed()),
+        Err(error) => return subscription_failed(&token, &error, "ItemsPropertiesUpdated"),
+    }
 
     // `get_live` fetched the properties *before* the subscriptions above existed, so a
     // value an app set in that window (common for apps that register first and populate
     // afterwards) was missed and no signal will replay it. Re-read everything once now.
     pending.request(PendingRefresh::ALL);
-    tokio::spawn(refresh_worker(
-        weak_item.clone(),
-        item_proxy,
-        menu_proxy,
-        Arc::clone(&pending),
-        worker_token,
-    ));
+    debug!("Tray item '{bus_name}' monitoring started");
+}
 
-    let mut menu_dirty = false;
-    let menu_debounce = sleep(MENU_DEBOUNCE);
-    tokio::pin!(menu_debounce);
+fn subscription_failed(token: &CancellationToken, error: &zbus::Error, signal: &str) {
+    error!(error = %error, signal, "cannot subscribe to tray item signal");
+    token.cancel();
+}
 
+/// Drains `stream` for as long as it lives, calling `on_signal` (which must not block or
+/// await) for every message, until `token` is cancelled or the stream ends.
+fn spawn_pump<S>(stream: S, token: CancellationToken, on_signal: impl Fn() + Send + 'static)
+where
+    S: Stream + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::pin!(stream);
+        loop {
+            tokio::select! {
+                () = token.cancelled() => return,
+                next = stream.next() => match next {
+                    Some(_) => on_signal(),
+                    None => return,
+                },
+            }
+        }
+    });
+}
+
+/// Turns bursts of menu signals into one layout fetch once they go quiet for
+/// [`MENU_DEBOUNCE`].
+async fn debounce_menu(
+    menu_signal: Arc<Notify>,
+    pending: Arc<PendingRefresh>,
+    token: CancellationToken,
+) {
     loop {
-        if weak_item.strong_count() == 0 {
-            return;
-        }
-
         tokio::select! {
-            _ = cancellation_token.cancelled() => {
-                debug!("Tray item '{bus_name}' monitor received cancellation, stopping");
-                return;
-            }
-
-            _ = &mut menu_debounce, if menu_dirty => {
-                debug!("menu debounce fired, scheduling layout fetch");
-                menu_dirty = false;
-                pending.request(PendingRefresh::MENU);
-            }
-
-            Some(_) = new_menu.next() => {
-                debug!("new_menu signal received, scheduling debounced refresh");
-                menu_dirty = true;
-                menu_debounce.as_mut().reset(Instant::now() + MENU_DEBOUNCE);
-            }
-
-            Some(_) = layout_updated.next() => {
-                debug!("layout_updated signal received, scheduling debounced refresh");
-                menu_dirty = true;
-                menu_debounce.as_mut().reset(Instant::now() + MENU_DEBOUNCE);
-            }
-
-            Some(_) = items_properties_updated.next() => {
-                debug!("items_properties_updated signal received, scheduling debounced refresh");
-                menu_dirty = true;
-                menu_debounce.as_mut().reset(Instant::now() + MENU_DEBOUNCE);
-            }
-
-            Some(_) = new_icon.next() => {
-                debug!("NewIcon signal received");
-                pending.request(PendingRefresh::ICON);
-            }
-
-            Some(_) = new_attention_icon.next() => {
-                debug!("NewAttentionIcon signal received");
-                pending.request(PendingRefresh::ATTENTION_ICON);
-            }
-
-            Some(_) = new_overlay_icon.next() => {
-                debug!("NewOverlayIcon signal received");
-                pending.request(PendingRefresh::OVERLAY_ICON);
-            }
-
-            else => {
-                debug!("All signal streams ended for tray item {bus_name}, exiting monitor");
-                break;
+            () = token.cancelled() => return,
+            () = menu_signal.notified() => {}
+        }
+        loop {
+            tokio::select! {
+                () = token.cancelled() => return,
+                () = sleep(MENU_DEBOUNCE) => break,
+                () = menu_signal.notified() => {}
             }
         }
+        debug!("menu signals settled, scheduling layout fetch");
+        pending.request(PendingRefresh::MENU);
     }
 }
 
 /// Performs the D-Bus fetches requested through `pending`, one batch at a time.
 ///
 /// Runs on its own task so a slow or unresponsive item only delays its own refreshes;
-/// the signal loop keeps draining regardless. Each batch is raced against cancellation,
+/// the signal pumps keep draining regardless. Each batch is raced against cancellation,
 /// so a peer that never answers cannot keep this task alive after the item is removed.
 async fn refresh_worker(
     weak_item: Weak<TrayItem>,
@@ -270,6 +257,8 @@ async fn refresh_worker(
             continue;
         }
         let Some(tray_item) = weak_item.upgrade() else {
+            // The item is gone; stop the pumps and the debouncer too.
+            cancellation_token.cancel();
             return;
         };
 
