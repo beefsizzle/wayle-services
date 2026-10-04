@@ -20,7 +20,7 @@ use crate::{
     },
     error::Error,
     types::{
-        device::{Device, DeviceKey, DevicePort, DeviceState, DeviceType, SinkInfo},
+        device::{Device, DeviceKey, DevicePort, DeviceState, DeviceTarget, DeviceType, SinkInfo},
         format::{AudioFormat, ChannelMap, SampleSpec},
     },
     volume::types::Volume,
@@ -58,6 +58,10 @@ pub struct OutputDevice {
 
     /// Device key for identification
     pub key: DeviceKey,
+
+    /// Which appearance of the device at `key` this handle belongs to.
+    #[debug(skip)]
+    pub(crate) instance: u64,
 
     /// Device name (internal identifier)
     pub name: Property<String>,
@@ -205,6 +209,7 @@ impl OutputDevice {
             event_tx,
             cancellation_token,
             key: sink.key(),
+            instance: sink.device.instance,
             name: Property::new(sink.device.name.clone()),
             description: Property::new(sink.device.description.clone()),
             card_index: Property::new(sink.device.card_index),
@@ -254,35 +259,54 @@ impl OutputDevice {
         self.flags.set(sink.device.flags);
     }
 
+    fn target(&self) -> DeviceTarget {
+        DeviceTarget {
+            key: self.key,
+            instance: Some(self.instance),
+        }
+    }
+
     /// Set the volume for this output device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_volume(&self, volume: Volume) -> Result<(), Error> {
-        OutputDeviceController::set_volume(&self.command_tx, self.key, volume).await
+        OutputDeviceController::set_volume(&self.command_tx, self.target(), volume).await
     }
 
     /// Set the mute state for this output device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_mute(&self, muted: bool) -> Result<(), Error> {
-        OutputDeviceController::set_mute(&self.command_tx, self.key, muted).await
+        OutputDeviceController::set_mute(&self.command_tx, self.target(), muted).await
     }
 
     /// Set the active port for this output device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_port(&self, port: String) -> Result<(), Error> {
-        OutputDeviceController::set_port(&self.command_tx, self.key, port).await
+        OutputDeviceController::set_port(&self.command_tx, self.target(), port).await
     }
 
     /// Set this device as the default output.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_as_default(&self) -> Result<(), Error> {
-        OutputDeviceController::set_as_default(&self.command_tx, self.key).await
+        OutputDeviceController::set_as_default(&self.command_tx, self.target()).await
     }
 }

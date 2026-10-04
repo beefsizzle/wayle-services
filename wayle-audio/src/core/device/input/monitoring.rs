@@ -44,7 +44,14 @@ impl ModelMonitoring for InputDevice {
                         };
 
                         match event {
-                            AudioEvent::DeviceChanged(Device::Source(source)) if source.key() == device_key => {
+                            AudioEvent::DeviceChanged(Device::Source(source))
+                                if source.key() == device_key =>
+                            {
+                                if source.device.instance != device.instance {
+                                    // Another device took over the index.
+                                    device.state.set(DeviceState::Offline);
+                                    break;
+                                }
                                 device.update_from_source(&source);
                             }
                             AudioEvent::DeviceRemoved(key) if key == device_key => {

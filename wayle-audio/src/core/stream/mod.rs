@@ -21,7 +21,7 @@ use crate::{
     types::{
         device::DeviceKey,
         format::{ChannelMap, SampleSpec},
-        stream::{MediaInfo, StreamInfo, StreamKey, StreamState},
+        stream::{MediaInfo, StreamInfo, StreamKey, StreamState, StreamTarget},
     },
     volume::types::Volume,
 };
@@ -55,6 +55,10 @@ pub struct AudioStream {
 
     /// Stream key for identification
     pub key: StreamKey,
+
+    /// Which appearance of the stream at `key` this handle belongs to.
+    #[debug(skip)]
+    pub(crate) instance: u64,
 
     /// Stream name
     pub name: Property<String>,
@@ -190,6 +194,7 @@ impl AudioStream {
             event_tx,
             cancellation_token,
             key: info.key(),
+            instance: info.instance,
             name: Property::new(info.name),
             application_name: Property::new(info.application_name),
             binary: Property::new(info.binary),
@@ -241,27 +246,44 @@ impl AudioStream {
         self.format.set(info.format.clone());
     }
 
+    fn target(&self) -> StreamTarget {
+        StreamTarget {
+            key: self.key,
+            instance: self.instance,
+        }
+    }
+
     /// Set the volume for this audio stream.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or stream operation fails.
+    /// Returns [`Error::StreamNotFound`] if the stream this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// stream now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_volume(&self, volume: Volume) -> Result<(), Error> {
-        AudioStreamController::set_volume(&self.command_tx, self.key, volume).await
+        AudioStreamController::set_volume(&self.command_tx, self.target(), volume).await
     }
 
     /// Set the mute state for this audio stream.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or stream operation fails.
+    /// Returns [`Error::StreamNotFound`] if the stream this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// stream now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_mute(&self, muted: bool) -> Result<(), Error> {
-        AudioStreamController::set_mute(&self.command_tx, self.key, muted).await
+        AudioStreamController::set_mute(&self.command_tx, self.target(), muted).await
     }
 
     /// Move this stream to a different device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device doesn't exist.
+    /// Returns [`Error::StreamNotFound`] if the stream this handle was created
+    /// for is gone (see [`set_volume`](Self::set_volume)),
+    /// [`Error::DeviceNotFound`] if no device of the matching direction has
+    /// `device_key`, and [`Error::NotConnected`] while the audio server is not
+    /// connected.
     pub async fn move_to_device(&self, device_key: DeviceKey) -> Result<(), Error> {
-        AudioStreamController::move_to_device(&self.command_tx, self.key, device_key).await
+        AudioStreamController::move_to_device(&self.command_tx, self.target(), device_key).await
     }
 }

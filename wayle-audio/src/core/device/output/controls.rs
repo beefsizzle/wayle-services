@@ -4,24 +4,24 @@ use tracing::instrument;
 use crate::{
     backend::{commands::Command, types::CommandSender},
     error::Error,
-    types::device::DeviceKey,
+    types::device::DeviceTarget,
     volume::types::Volume,
 };
 
 pub(crate) struct OutputDeviceController;
 
 impl OutputDeviceController {
-    #[instrument(skip(command_tx), fields(device = ?device_key, volume = ?volume), err)]
+    #[instrument(skip(command_tx), fields(device = ?device.key, volume = ?volume), err)]
     pub async fn set_volume(
         command_tx: &CommandSender,
-        device_key: DeviceKey,
+        device: DeviceTarget,
         volume: Volume,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::SetVolume {
-                device_key,
+                device,
                 volume,
                 responder: tx,
             })
@@ -30,17 +30,17 @@ impl OutputDeviceController {
         rx.await.map_err(|_| Error::CommandChannelDisconnected)?
     }
 
-    #[instrument(skip(command_tx), fields(device = ?device_key, muted = muted), err)]
+    #[instrument(skip(command_tx), fields(device = ?device.key, muted = muted), err)]
     pub async fn set_mute(
         command_tx: &CommandSender,
-        device_key: DeviceKey,
+        device: DeviceTarget,
         muted: bool,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::SetMute {
-                device_key,
+                device,
                 muted,
                 responder: tx,
             })
@@ -49,17 +49,17 @@ impl OutputDeviceController {
         rx.await.map_err(|_| Error::CommandChannelDisconnected)?
     }
 
-    #[instrument(skip(command_tx), fields(device = ?device_key, port = %port), err)]
+    #[instrument(skip(command_tx), fields(device = ?device.key, port = %port), err)]
     pub async fn set_port(
         command_tx: &CommandSender,
-        device_key: DeviceKey,
+        device: DeviceTarget,
         port: String,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::SetPort {
-                device_key,
+                device,
                 port,
                 responder: tx,
             })
@@ -68,16 +68,16 @@ impl OutputDeviceController {
         rx.await.map_err(|_| Error::CommandChannelDisconnected)?
     }
 
-    #[instrument(skip(command_tx), fields(device = ?device_key), err)]
+    #[instrument(skip(command_tx), fields(device = ?device.key), err)]
     pub async fn set_as_default(
         command_tx: &CommandSender,
-        device_key: DeviceKey,
+        device: DeviceTarget,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::SetDefaultOutput {
-                device_key,
+                device,
                 responder: tx,
             })
             .map_err(|_| Error::CommandChannelDisconnected)?;

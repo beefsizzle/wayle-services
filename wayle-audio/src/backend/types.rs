@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use libpulse_binding::{
@@ -14,12 +17,21 @@ use crate::{
     error::Error,
     events::AudioEvent,
     types::{
-        device::{Device, DeviceKey},
-        stream::{StreamInfo, StreamKey},
+        device::{Device, DeviceKey, DeviceTarget},
+        stream::{StreamInfo, StreamKey, StreamTarget},
     },
 };
 
 pub(crate) type DeviceStore = Arc<RwLock<HashMap<DeviceKey, Device>>>;
+
+/// Returns a process-wide unique id for an object entering a store.
+///
+/// Server indices are not enough to identify objects across reconnects (or
+/// on PipeWire, even within one connection), because they are reused.
+pub(crate) fn next_instance() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 pub(crate) type StreamStore = Arc<RwLock<HashMap<StreamKey, StreamInfo>>>;
 
@@ -88,33 +100,33 @@ impl ExternalCommand {
 #[derive(Debug)]
 pub(crate) enum Mutation {
     SetDeviceVolume {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         volume: ChannelVolumes,
     },
     SetDeviceMute {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         muted: bool,
     },
     SetStreamVolume {
-        stream_key: StreamKey,
+        stream: StreamTarget,
         volume: ChannelVolumes,
     },
     SetStreamMute {
-        stream_key: StreamKey,
+        stream: StreamTarget,
         muted: bool,
     },
     SetDefaultInput {
-        device_key: DeviceKey,
+        device: DeviceTarget,
     },
     SetDefaultOutput {
-        device_key: DeviceKey,
+        device: DeviceTarget,
     },
     MoveStream {
-        stream_key: StreamKey,
+        stream: StreamTarget,
         device_key: DeviceKey,
     },
     SetPort {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         port: String,
     },
 }

@@ -63,6 +63,12 @@ pub struct MediaInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StreamInfo {
     pub index: u32,
+    /// Identifies this appearance of the object in the backend store.
+    ///
+    /// Assigned when the object is first stored and kept while it only
+    /// changes. A removed object that comes back, and every object after a
+    /// reconnect, gets a new one, even if the server reuses its index.
+    pub instance: u64,
     pub stream_type: StreamType,
     pub name: String,
     pub application_name: Option<String>,
@@ -97,6 +103,14 @@ impl StreamInfo {
     }
 }
 
+/// Addresses the stream a command applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamTarget {
+    pub key: StreamKey,
+    /// The [`StreamInfo::instance`] the caller saw.
+    pub instance: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +126,7 @@ mod tests {
 
         StreamInfo {
             index: 0,
+            instance: 0,
             stream_type,
             name: String::from("test"),
             application_name: None,

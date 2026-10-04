@@ -45,6 +45,11 @@ impl ModelMonitoring for AudioStream {
                     Ok(event) = event_rx.recv() => {
                         match event {
                             AudioEvent::StreamChanged(info) if info.key() == stream_key => {
+                                if info.instance != stream.instance {
+                                    // Another stream took over the index.
+                                    stream.state.set(StreamState::Terminated);
+                                    break;
+                                }
                                 stream.update_from_info(&info);
                             }
                             AudioEvent::StreamRemoved(key) if key == stream_key => {

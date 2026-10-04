@@ -10,6 +10,8 @@ use crate::types::stream::{StreamInfo, StreamState, StreamType};
 pub(crate) fn from_sink_input(input: &SinkInputInfo) -> StreamInfo {
     StreamInfo {
         index: input.index,
+        // Assigned when the object is stored.
+        instance: 0,
         stream_type: StreamType::Playback,
         name: input.name.clone().unwrap_or_default().to_string(),
         application_name: input.proplist.get_str("application.name"),
@@ -50,6 +52,8 @@ pub(crate) fn from_sink_input(input: &SinkInputInfo) -> StreamInfo {
 pub(crate) fn from_source_output(output: &SourceOutputInfo) -> StreamInfo {
     StreamInfo {
         index: output.index,
+        // Assigned when the object is stored.
+        instance: 0,
         stream_type: StreamType::Record,
         name: output.name.clone().unwrap_or_default().to_string(),
         application_name: output.proplist.get_str("application.name"),

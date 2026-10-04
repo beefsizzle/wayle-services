@@ -3,10 +3,12 @@ use std::sync::Arc;
 use libpulse_binding::context::Context;
 use tracing::warn;
 
+use super::device::resolve_device_name;
 use crate::{
     backend::types::{DefaultDevice, DeviceStore, EventSender},
+    error::Error,
     events::AudioEvent,
-    types::device::{Device, DeviceKey},
+    types::device::{Device, DeviceTarget, DeviceType},
 };
 
 pub(crate) fn trigger_info_query(
@@ -82,32 +84,32 @@ pub(crate) fn trigger_info_query(
 
 pub(crate) fn set_default_input(
     context: &mut Context,
-    device_key: DeviceKey,
     devices: &DeviceStore,
-) {
-    if let Ok(devices_guard) = devices.read()
-        && let Some(device) = devices_guard.values().find(|d| d.key() == device_key)
-    {
-        let name = match device {
-            Device::Sink(sink) => &sink.device.name,
-            Device::Source(source) => &source.device.name,
-        };
-        context.set_default_source(name.as_str(), |_success| {});
+    target: DeviceTarget,
+) -> Result<(), Error> {
+    let name = resolve_device_name(devices, target)?;
+    if target.key.device_type != DeviceType::Input {
+        return Err(Error::DeviceNotFound {
+            index: target.key.index,
+            device_type: DeviceType::Input,
+        });
     }
+    context.set_default_source(&name, |_success| {});
+    Ok(())
 }
 
 pub(crate) fn set_default_output(
     context: &mut Context,
-    device_key: DeviceKey,
     devices: &DeviceStore,
-) {
-    if let Ok(devices_guard) = devices.read()
-        && let Some(device) = devices_guard.values().find(|d| d.key() == device_key)
-    {
-        let name = match device {
-            Device::Sink(sink) => &sink.device.name,
-            Device::Source(source) => &source.device.name,
-        };
-        context.set_default_sink(name.as_str(), |_success| {});
+    target: DeviceTarget,
+) -> Result<(), Error> {
+    let name = resolve_device_name(devices, target)?;
+    if target.key.device_type != DeviceType::Output {
+        return Err(Error::DeviceNotFound {
+            index: target.key.index,
+            device_type: DeviceType::Output,
+        });
     }
+    context.set_default_sink(&name, |_success| {});
+    Ok(())
 }

@@ -59,6 +59,12 @@ impl DeviceKey {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeviceInfo {
     pub index: u32,
+    /// Identifies this appearance of the object in the backend store.
+    ///
+    /// Assigned when the object is first stored and kept while it only
+    /// changes. A removed object that comes back, and every object after a
+    /// reconnect, gets a new one, even if the server reuses its index.
+    pub instance: u64,
     pub name: String,
     pub description: String,
     pub card_index: Option<u32>,
@@ -129,4 +135,27 @@ impl Device {
             Device::Source(source) => source.key(),
         }
     }
+
+    pub(crate) fn info(&self) -> &DeviceInfo {
+        match self {
+            Device::Sink(sink) => &sink.device,
+            Device::Source(source) => &source.device,
+        }
+    }
+
+    pub(crate) fn info_mut(&mut self) -> &mut DeviceInfo {
+        match self {
+            Device::Sink(sink) => &mut sink.device,
+            Device::Source(source) => &mut source.device,
+        }
+    }
+}
+
+/// Addresses the device a command applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeviceTarget {
+    pub key: DeviceKey,
+    /// The [`DeviceInfo::instance`] the caller saw, or `None` to accept
+    /// whichever device currently has `key`.
+    pub instance: Option<u64>,
 }

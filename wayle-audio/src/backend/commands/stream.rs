@@ -6,13 +6,18 @@ use libpulse_binding::{
     volume::ChannelVolumes,
 };
 
+use super::device::resolve_device_name;
 use crate::{
     backend::{
         conversion::stream::{from_sink_input, from_source_output},
-        types::{EventSender, StreamStore},
+        types::{DeviceStore, EventSender, StreamStore, next_instance},
     },
+    error::Error,
     events::AudioEvent,
-    types::stream::{StreamInfo, StreamKey, StreamType},
+    types::{
+        device::{DeviceKey, DeviceTarget, DeviceType},
+        stream::{StreamInfo, StreamKey, StreamTarget, StreamType},
+    },
 };
 
 pub(crate) fn trigger_discovery(context: &Context, streams: &StreamStore, events_tx: &EventSender) {
@@ -83,7 +88,7 @@ pub(crate) fn trigger_refresh(
 
 pub(crate) fn process_stream_update(
     stream_key: StreamKey,
-    stream_data: StreamInfo,
+    mut stream_data: StreamInfo,
     streams: &StreamStore,
     events_tx: &EventSender,
 ) {
@@ -91,10 +96,11 @@ pub(crate) fn process_stream_update(
         return;
     };
 
-    let is_new = !streams_guard.contains_key(&stream_key);
+    let existing = streams_guard.get(&stream_key).map(|stream| stream.instance);
+    stream_data.instance = existing.unwrap_or_else(next_instance);
     streams_guard.insert(stream_key, stream_data.clone());
 
-    let event = if is_new {
+    let event = if existing.is_none() {
         AudioEvent::StreamAdded(stream_data)
     } else {
         AudioEvent::StreamChanged(stream_data)
@@ -103,89 +109,89 @@ pub(crate) fn process_stream_update(
     let _ = events_tx.send(event);
 }
 
+/// Checks that the stream `target` addresses still exists.
+///
+/// Streams only have indices, which the server reuses, so the instance the
+/// caller saw must match the stored one; otherwise the index now belongs to
+/// another stream (for example after a server restart) and the command fails
+/// with [`Error::StreamNotFound`].
+pub(crate) fn resolve_stream(streams: &StreamStore, target: StreamTarget) -> Result<(), Error> {
+    let streams = streams.read().map_err(|_| Error::LockPoisoned)?;
+    match streams.get(&target.key) {
+        Some(stream) if stream.instance == target.instance => Ok(()),
+        _ => Err(Error::StreamNotFound {
+            index: target.key.index,
+            stream_type: target.key.stream_type,
+        }),
+    }
+}
+
 pub(crate) fn set_stream_volume(
     context: &Context,
-    stream_key: StreamKey,
-    volume: ChannelVolumes,
     streams: &StreamStore,
-) {
-    let streams_clone = Arc::clone(streams);
+    target: StreamTarget,
+    volume: &ChannelVolumes,
+) -> Result<(), Error> {
+    resolve_stream(streams, target)?;
     let mut introspect = context.introspect();
-
-    let stream_info = {
-        if let Ok(streams_guard) = streams_clone.read() {
-            streams_guard.get(&stream_key).cloned()
-        } else {
-            return;
-        }
+    let index = target.key.index;
+    match target.key.stream_type {
+        StreamType::Playback => introspect.set_sink_input_volume(index, volume, None),
+        StreamType::Record => introspect.set_source_output_volume(index, volume, None),
     };
-
-    if let Some(info) = stream_info {
-        match info.stream_type {
-            StreamType::Playback => {
-                introspect.set_sink_input_volume(stream_key.index, &volume, None);
-            }
-            StreamType::Record => {
-                introspect.set_source_output_volume(stream_key.index, &volume, None);
-            }
-        }
-    }
+    Ok(())
 }
 
 pub(crate) fn set_stream_mute(
     context: &Context,
-    stream_key: StreamKey,
-    muted: bool,
     streams: &StreamStore,
-) {
-    let streams_clone = Arc::clone(streams);
+    target: StreamTarget,
+    muted: bool,
+) -> Result<(), Error> {
+    resolve_stream(streams, target)?;
     let mut introspect = context.introspect();
-
-    let stream_info = {
-        if let Ok(streams_guard) = streams_clone.read() {
-            streams_guard.get(&stream_key).cloned()
-        } else {
-            return;
-        }
+    let index = target.key.index;
+    match target.key.stream_type {
+        StreamType::Playback => introspect.set_sink_input_mute(index, muted, None),
+        StreamType::Record => introspect.set_source_output_mute(index, muted, None),
     };
-
-    if let Some(info) = stream_info {
-        match info.stream_type {
-            StreamType::Playback => {
-                introspect.set_sink_input_mute(stream_key.index, muted, None);
-            }
-            StreamType::Record => {
-                introspect.set_source_output_mute(stream_key.index, muted, None);
-            }
-        }
-    }
+    Ok(())
 }
 
+/// Moves a stream to the device with `device_key`, which must be a sink for
+/// playback streams and a source for recording streams.
 pub(crate) fn move_stream(
     context: &Context,
-    stream_key: StreamKey,
-    device_key: crate::types::device::DeviceKey,
     streams: &StreamStore,
-) {
-    let streams_clone = Arc::clone(streams);
-    let mut introspect = context.introspect();
+    devices: &DeviceStore,
+    target: StreamTarget,
+    device_key: DeviceKey,
+) -> Result<(), Error> {
+    resolve_stream(streams, target)?;
 
-    let stream_info = {
-        if let Ok(streams_guard) = streams_clone.read() {
-            streams_guard.get(&stream_key).cloned()
-        } else {
-            return;
-        }
+    let expected_type = match target.key.stream_type {
+        StreamType::Playback => DeviceType::Output,
+        StreamType::Record => DeviceType::Input,
     };
-
-    if let Some(info) = stream_info {
-        match info.stream_type {
-            StreamType::Playback => {
-                introspect.move_sink_input_by_index(stream_key.index, device_key.index, None);
-            }
-            StreamType::Record => {
-                introspect.move_source_output_by_index(stream_key.index, device_key.index, None);
-            }
-        }
+    if device_key.device_type != expected_type {
+        return Err(Error::DeviceNotFound {
+            index: device_key.index,
+            device_type: expected_type,
+        });
     }
+    let device_name = resolve_device_name(
+        devices,
+        DeviceTarget {
+            key: device_key,
+            instance: None,
+        },
+    )?;
+
+    let mut introspect = context.introspect();
+    let index = target.key.index;
+    match target.key.stream_type {
+        StreamType::Playback => introspect.move_sink_input_by_name(index, &device_name, None),
+        StreamType::Record => introspect.move_source_output_by_name(index, &device_name, None),
+    };
+    Ok(())
 }

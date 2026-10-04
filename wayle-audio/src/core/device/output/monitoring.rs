@@ -47,6 +47,11 @@ impl ModelMonitoring for OutputDevice {
                             AudioEvent::DeviceChanged(Device::Sink(sink))
                                 if sink.key() == device_key =>
                             {
+                                if sink.device.instance != device.instance {
+                                    // Another device took over the index.
+                                    device.state.set(DeviceState::Offline);
+                                    break;
+                                }
                                 device.update_from_sink(&sink);
                             }
                             AudioEvent::DeviceRemoved(key) if key == device_key => {

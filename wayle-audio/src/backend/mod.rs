@@ -301,61 +301,53 @@ impl PulseBackend {
                 let _ = responder.send(result);
             }
             Command::SetVolume {
-                device_key,
+                device,
                 volume,
                 responder,
             } => gate.submit(
                 Mutation::SetDeviceVolume {
-                    device_key,
+                    device,
                     volume: convert_volume_to_pulse(&volume),
                 },
                 responder,
             ),
             Command::SetMute {
-                device_key,
+                device,
                 muted,
                 responder,
-            } => gate.submit(Mutation::SetDeviceMute { device_key, muted }, responder),
+            } => gate.submit(Mutation::SetDeviceMute { device, muted }, responder),
             Command::SetStreamVolume {
-                stream_key,
+                stream,
                 volume,
                 responder,
             } => gate.submit(
                 Mutation::SetStreamVolume {
-                    stream_key,
+                    stream,
                     volume: convert_volume_to_pulse(&volume),
                 },
                 responder,
             ),
             Command::SetStreamMute {
-                stream_key,
+                stream,
                 muted,
                 responder,
-            } => gate.submit(Mutation::SetStreamMute { stream_key, muted }, responder),
-            Command::SetDefaultInput {
-                device_key,
-                responder,
-            } => gate.submit(Mutation::SetDefaultInput { device_key }, responder),
-            Command::SetDefaultOutput {
-                device_key,
-                responder,
-            } => gate.submit(Mutation::SetDefaultOutput { device_key }, responder),
+            } => gate.submit(Mutation::SetStreamMute { stream, muted }, responder),
+            Command::SetDefaultInput { device, responder } => {
+                gate.submit(Mutation::SetDefaultInput { device }, responder)
+            }
+            Command::SetDefaultOutput { device, responder } => {
+                gate.submit(Mutation::SetDefaultOutput { device }, responder)
+            }
             Command::MoveStream {
-                stream_key,
+                stream,
                 device_key,
                 responder,
-            } => gate.submit(
-                Mutation::MoveStream {
-                    stream_key,
-                    device_key,
-                },
-                responder,
-            ),
+            } => gate.submit(Mutation::MoveStream { stream, device_key }, responder),
             Command::SetPort {
-                device_key,
+                device,
                 port,
                 responder,
-            } => gate.submit(Mutation::SetPort { device_key, port }, responder),
+            } => gate.submit(Mutation::SetPort { device, port }, responder),
         }
     }
 
@@ -492,13 +484,13 @@ impl Connector for PulseBackend {
                 }
 
                 Some(command) = self.external_rx.recv() => {
-                    handle_external_command(
+                    let result = handle_external_command(
                         &mut connection.context,
                         command.mutation,
                         &self.state.devices,
                         &self.state.streams,
                     );
-                    let _ = command.responder.send(Ok(()));
+                    let _ = command.responder.send(result);
                 }
             }
         };
@@ -531,9 +523,12 @@ mod tests {
     use super::*;
     use crate::{
         types::{
-            device::{Device, DeviceInfo, DeviceKey, DeviceState, SinkInfo, SourceInfo},
+            device::{
+                Device, DeviceInfo, DeviceKey, DeviceState, DeviceTarget, DeviceType, SinkInfo,
+                SourceInfo,
+            },
             format::{ChannelMap, SampleFormat, SampleSpec},
-            stream::{MediaInfo, StreamInfo, StreamKey, StreamState, StreamType},
+            stream::{MediaInfo, StreamInfo, StreamKey, StreamState, StreamTarget, StreamType},
         },
         volume::types::Volume,
     };
@@ -541,6 +536,7 @@ mod tests {
     fn device_info(index: u32) -> DeviceInfo {
         DeviceInfo {
             index,
+            instance: u64::from(index),
             name: format!("device-{index}"),
             description: format!("Device {index}"),
             card_index: None,
@@ -590,6 +586,7 @@ mod tests {
     fn stream(index: u32, stream_type: StreamType) -> StreamInfo {
         StreamInfo {
             index,
+            instance: u64::from(index),
             stream_type,
             name: format!("stream-{index}"),
             application_name: None,
@@ -736,7 +733,10 @@ mod tests {
 
     fn submit(gate: &CommandGate) -> tokio::sync::oneshot::Receiver<Result<(), Error>> {
         let mutation = Mutation::SetDeviceMute {
-            device_key: sink(1).key(),
+            device: DeviceTarget {
+                key: sink(1).key(),
+                instance: Some(1),
+            },
             muted: true,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -803,5 +803,111 @@ mod tests {
         let mut reply = submit(&gate);
 
         assert!(matches!(reply.try_recv(), Ok(Err(Error::NotConnected))));
+    }
+
+    fn device_target(device: &Device, instance: Option<u64>) -> DeviceTarget {
+        DeviceTarget {
+            key: device.key(),
+            instance,
+        }
+    }
+
+    #[test]
+    fn device_target_resolves_only_the_instance_it_was_created_for() {
+        let state = populated_state();
+        let current = sink(2);
+        let instance = current.info().instance;
+
+        let resolved = commands::device::resolve_device_name(
+            &state.devices,
+            device_target(&current, Some(instance)),
+        );
+        assert_eq!(resolved.unwrap(), "device-2");
+
+        let stale = commands::device::resolve_device_name(
+            &state.devices,
+            device_target(&current, Some(instance + 1000)),
+        );
+        assert!(matches!(
+            stale,
+            Err(Error::DeviceNotFound {
+                index: 2,
+                device_type: DeviceType::Output
+            })
+        ));
+
+        let any =
+            commands::device::resolve_device_name(&state.devices, device_target(&current, None));
+        assert_eq!(any.unwrap(), "device-2");
+
+        let missing =
+            commands::device::resolve_device_name(&state.devices, device_target(&sink(9), None));
+        assert!(matches!(
+            missing,
+            Err(Error::DeviceNotFound { index: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn stream_target_resolves_only_the_instance_it_was_created_for() {
+        let state = populated_state();
+        let key = StreamKey::new(7, StreamType::Playback);
+
+        let current =
+            commands::stream::resolve_stream(&state.streams, StreamTarget { key, instance: 7 });
+        assert!(current.is_ok());
+
+        let stale =
+            commands::stream::resolve_stream(&state.streams, StreamTarget { key, instance: 8 });
+        assert!(matches!(stale, Err(Error::StreamNotFound { index: 7, .. })));
+    }
+
+    #[test]
+    fn device_keeps_instance_while_present_and_gets_a_new_one_when_readded() {
+        let state = BackendState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(100);
+        let key = sink(3).key();
+        let stored_instance =
+            |state: &BackendState| state.devices.read().unwrap()[&key].info().instance;
+
+        commands::device::process_device_update(key, sink(3), &state.devices, &event_tx);
+        let first = stored_instance(&state);
+        commands::device::process_device_update(key, sink(3), &state.devices, &event_tx);
+        assert_eq!(
+            stored_instance(&state),
+            first,
+            "a change keeps the instance"
+        );
+
+        state.devices.write().unwrap().remove(&key);
+        commands::device::process_device_update(key, sink(3), &state.devices, &event_tx);
+        let second = stored_instance(&state);
+        assert_ne!(
+            second, first,
+            "a re-added device must not match old handles"
+        );
+
+        let events = drain(&mut event_rx);
+        assert!(matches!(&events[0], AudioEvent::DeviceAdded(d) if d.info().instance == first));
+        assert!(matches!(&events[1], AudioEvent::DeviceChanged(d) if d.info().instance == first));
+        assert!(matches!(&events[2], AudioEvent::DeviceAdded(d) if d.info().instance == second));
+    }
+
+    #[test]
+    fn stream_keeps_instance_while_present_and_gets_a_new_one_when_readded() {
+        let state = BackendState::new();
+        let (event_tx, _event_rx) = broadcast::channel(100);
+        let key = StreamKey::new(4, StreamType::Record);
+        let stored_instance = |state: &BackendState| state.streams.read().unwrap()[&key].instance;
+
+        let info = stream(4, StreamType::Record);
+        commands::stream::process_stream_update(key, info.clone(), &state.streams, &event_tx);
+        let first = stored_instance(&state);
+        commands::stream::process_stream_update(key, info.clone(), &state.streams, &event_tx);
+        assert_eq!(stored_instance(&state), first);
+
+        state.streams.write().unwrap().remove(&key);
+        commands::stream::process_stream_update(key, info, &state.streams, &event_tx);
+        assert_ne!(stored_instance(&state), first);
     }
 }

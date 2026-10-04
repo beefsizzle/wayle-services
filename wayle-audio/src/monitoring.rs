@@ -58,7 +58,7 @@ impl ServiceMonitoring for AudioService {
                                             Some(cancellation_token.child_token()),
                                         ));
                                         output.clone().start_monitoring().await.ok();
-                                        output_devs.insert(key, output);
+                                        cancel_replaced(output_devs.insert(key, output).and_then(|old| old.cancellation_token.clone()));
                                         output_devices.set(output_devs.values().cloned().collect());
                                     }
                                     Device::Source(source) => {
@@ -70,7 +70,7 @@ impl ServiceMonitoring for AudioService {
                                             Some(cancellation_token.child_token()),
                                         ));
                                         input.clone().start_monitoring().await.ok();
-                                        input_devs.insert(key, input);
+                                        cancel_replaced(input_devs.insert(key, input).and_then(|old| old.cancellation_token.clone()));
                                         input_devices.set(input_devs.values().cloned().collect());
                                     }
                                 }
@@ -80,7 +80,9 @@ impl ServiceMonitoring for AudioService {
                                 match device {
                                     Device::Sink(sink) => {
                                         let key = sink.key();
-                                        if let Some(existing) = output_devs.get(&key) {
+                                        if let Some(existing) = output_devs.get(&key)
+                                            && existing.instance == sink.device.instance
+                                        {
                                             existing.update_from_sink(&sink);
                                         } else {
                                             let output = Arc::new(OutputDevice::from_sink(
@@ -90,13 +92,15 @@ impl ServiceMonitoring for AudioService {
                                                 Some(cancellation_token.child_token()),
                                             ));
                                             output.clone().start_monitoring().await.ok();
-                                            output_devs.insert(key, output);
+                                            cancel_replaced(output_devs.insert(key, output).and_then(|old| old.cancellation_token.clone()));
                                             output_devices.set(output_devs.values().cloned().collect());
                                         }
                                     }
                                     Device::Source(source) => {
                                         let key = source.key();
-                                        if let Some(existing) = input_devs.get(&key) {
+                                        if let Some(existing) = input_devs.get(&key)
+                                            && existing.instance == source.device.instance
+                                        {
                                             existing.update_from_source(&source);
                                         } else {
                                             let input = Arc::new(InputDevice::from_source(
@@ -106,7 +110,7 @@ impl ServiceMonitoring for AudioService {
                                                 Some(cancellation_token.child_token()),
                                             ));
                                             input.clone().start_monitoring().await.ok();
-                                            input_devs.insert(key, input);
+                                            cancel_replaced(input_devs.insert(key, input).and_then(|old| old.cancellation_token.clone()));
                                             input_devices.set(input_devs.values().cloned().collect());
                                         }
                                     }
@@ -121,7 +125,8 @@ impl ServiceMonitoring for AudioService {
 
                                     output_devices.set(output_devs.values().cloned().collect());
                                 }
-                                if input_devs.remove(&key).is_some() {
+                                if let Some(device) = input_devs.remove(&key) {
+                                    cancel_replaced(device.cancellation_token.clone());
                                     input_devices.set(input_devs.values().cloned().collect());
                                 }
                             }
@@ -134,13 +139,15 @@ impl ServiceMonitoring for AudioService {
                                     Some(cancellation_token.child_token()),
                                 ));
                                 stream.clone().start_monitoring().await.ok();
-                                streams.insert(info.key(), stream);
+                                cancel_replaced(streams.insert(info.key(), stream).and_then(|old| old.cancellation_token.clone()));
                                 update_stream_properties(&streams, &playback_streams, &recording_streams);
                             }
 
                             AudioEvent::StreamChanged(info) => {
                                 let key = info.key();
-                                if let Some(existing) = streams.get(&key) {
+                                if let Some(existing) = streams.get(&key)
+                                    && existing.instance == info.instance
+                                {
                                     existing.update_from_info(&info);
                                 } else {
                                     let stream = Arc::new(AudioStream::from_info(
@@ -150,7 +157,7 @@ impl ServiceMonitoring for AudioService {
                                         Some(cancellation_token.child_token()),
                                     ));
                                     stream.clone().start_monitoring().await.ok();
-                                    streams.insert(key, stream);
+                                    cancel_replaced(streams.insert(key, stream).and_then(|old| old.cancellation_token.clone()));
                                     update_stream_properties(&streams, &playback_streams, &recording_streams);
                                 }
                             }
@@ -200,6 +207,13 @@ impl ServiceMonitoring for AudioService {
     }
 }
 
+/// Stops the monitor of a handle that was replaced by a newer one.
+fn cancel_replaced(token: Option<tokio_util::sync::CancellationToken>) {
+    if let Some(token) = token {
+        token.cancel();
+    }
+}
+
 fn update_stream_properties(
     streams: &HashMap<StreamKey, Arc<AudioStream>>,
     playback_streams: &Property<Vec<Arc<AudioStream>>>,
@@ -243,6 +257,7 @@ mod tests {
 
         let stream_info = StreamInfo {
             index,
+            instance: 0,
             stream_type,
             name: format!("test-stream-{}", index),
             application_name: None,

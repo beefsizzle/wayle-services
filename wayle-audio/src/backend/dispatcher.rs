@@ -4,6 +4,7 @@ use super::{
     commands::{device, server, stream},
     types::{DefaultDevice, DeviceStore, EventSender, InternalRefresh, Mutation, StreamStore},
 };
+use crate::error::Error;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_internal_command(
@@ -40,39 +41,41 @@ pub(super) fn handle_internal_command(
     }
 }
 
+/// Applies a mutation from a caller.
+///
+/// The target is validated against the stores at the moment the request is
+/// handed to libpulse, on the connection that will carry it, so a handle
+/// whose object is gone (or was replaced by another one at the same index)
+/// gets [`Error::DeviceNotFound`] or [`Error::StreamNotFound`] instead of
+/// changing something else.
 pub(super) fn handle_external_command(
     context: &mut Context,
     command: Mutation,
     devices: &DeviceStore,
     streams: &StreamStore,
-) {
+) -> Result<(), Error> {
     match command {
-        Mutation::SetDeviceVolume { device_key, volume } => {
-            device::set_device_volume(context, device_key, volume, devices);
+        Mutation::SetDeviceVolume { device, volume } => {
+            device::set_device_volume(context, devices, device, &volume)
         }
-        Mutation::SetDeviceMute { device_key, muted } => {
-            device::set_device_mute(context, device_key, muted, devices);
+        Mutation::SetDeviceMute { device, muted } => {
+            device::set_device_mute(context, devices, device, muted)
         }
-        Mutation::SetDefaultInput { device_key } => {
-            server::set_default_input(context, device_key, devices);
+        Mutation::SetDefaultInput { device } => server::set_default_input(context, devices, device),
+        Mutation::SetDefaultOutput { device } => {
+            server::set_default_output(context, devices, device)
         }
-        Mutation::SetDefaultOutput { device_key } => {
-            server::set_default_output(context, device_key, devices);
+        Mutation::SetStreamVolume { stream, volume } => {
+            stream::set_stream_volume(context, streams, stream, &volume)
         }
-        Mutation::SetStreamVolume { stream_key, volume } => {
-            stream::set_stream_volume(context, stream_key, volume, streams);
+        Mutation::SetStreamMute { stream, muted } => {
+            stream::set_stream_mute(context, streams, stream, muted)
         }
-        Mutation::SetStreamMute { stream_key, muted } => {
-            stream::set_stream_mute(context, stream_key, muted, streams);
+        Mutation::MoveStream { stream, device_key } => {
+            stream::move_stream(context, streams, devices, stream, device_key)
         }
-        Mutation::MoveStream {
-            stream_key,
-            device_key,
-        } => {
-            stream::move_stream(context, stream_key, device_key, streams);
-        }
-        Mutation::SetPort { device_key, port } => {
-            device::set_device_port(context, device_key, port, devices);
+        Mutation::SetPort { device, port } => {
+            device::set_device_port(context, devices, device, &port)
         }
     }
 }

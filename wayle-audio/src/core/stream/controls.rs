@@ -3,7 +3,7 @@ use tokio::sync::oneshot;
 use crate::{
     backend::{commands::Command, types::CommandSender},
     error::Error,
-    types::{device::DeviceKey, stream::StreamKey},
+    types::{device::DeviceKey, stream::StreamTarget},
     volume::types::Volume,
 };
 
@@ -12,14 +12,14 @@ pub(crate) struct AudioStreamController;
 impl AudioStreamController {
     pub async fn set_volume(
         command_tx: &CommandSender,
-        stream_key: StreamKey,
+        stream: StreamTarget,
         volume: Volume,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::SetStreamVolume {
-                stream_key,
+                stream,
                 volume,
                 responder: tx,
             })
@@ -30,14 +30,14 @@ impl AudioStreamController {
 
     pub async fn set_mute(
         command_tx: &CommandSender,
-        stream_key: StreamKey,
+        stream: StreamTarget,
         muted: bool,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::SetStreamMute {
-                stream_key,
+                stream,
                 muted,
                 responder: tx,
             })
@@ -48,14 +48,14 @@ impl AudioStreamController {
 
     pub async fn move_to_device(
         command_tx: &CommandSender,
-        stream_key: StreamKey,
+        stream: StreamTarget,
         device_key: DeviceKey,
     ) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
 
         command_tx
             .send(Command::MoveStream {
-                stream_key,
+                stream,
                 device_key,
                 responder: tx,
             })

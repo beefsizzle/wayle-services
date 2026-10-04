@@ -7,8 +7,8 @@ use tokio::sync::oneshot;
 use crate::{
     error::Error,
     types::{
-        device::{Device, DeviceKey},
-        stream::{StreamInfo, StreamKey},
+        device::{Device, DeviceKey, DeviceTarget},
+        stream::{StreamInfo, StreamKey, StreamTarget},
     },
     volume::types::Volume,
 };
@@ -24,40 +24,40 @@ pub(crate) enum Command {
         responder: oneshot::Sender<Result<StreamInfo, Error>>,
     },
     SetVolume {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         volume: Volume,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     SetMute {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         muted: bool,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     SetStreamVolume {
-        stream_key: StreamKey,
+        stream: StreamTarget,
         volume: Volume,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     SetStreamMute {
-        stream_key: StreamKey,
+        stream: StreamTarget,
         muted: bool,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     SetDefaultInput {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     SetDefaultOutput {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     MoveStream {
-        stream_key: StreamKey,
+        stream: StreamTarget,
         device_key: DeviceKey,
         responder: oneshot::Sender<Result<(), Error>>,
     },
     SetPort {
-        device_key: DeviceKey,
+        device: DeviceTarget,
         port: String,
         responder: oneshot::Sender<Result<(), Error>>,
     },

@@ -20,7 +20,9 @@ use crate::{
     },
     error::Error,
     types::{
-        device::{Device, DeviceKey, DevicePort, DeviceState, DeviceType, SourceInfo},
+        device::{
+            Device, DeviceKey, DevicePort, DeviceState, DeviceTarget, DeviceType, SourceInfo,
+        },
         format::{AudioFormat, ChannelMap, SampleSpec},
     },
     volume::types::Volume,
@@ -52,10 +54,14 @@ pub struct InputDevice {
 
     /// Cancellation token for monitoring (only for live instances)
     #[debug(skip)]
-    cancellation_token: Option<CancellationToken>,
+    pub(crate) cancellation_token: Option<CancellationToken>,
 
     /// Device key for identification
     pub key: DeviceKey,
+
+    /// Which appearance of the device at `key` this handle belongs to.
+    #[debug(skip)]
+    pub(crate) instance: u64,
 
     /// Device name (internal identifier)
     pub name: Property<String>,
@@ -206,6 +212,7 @@ impl InputDevice {
             event_tx,
             cancellation_token,
             key: source.key(),
+            instance: source.device.instance,
             name: Property::new(source.device.name.clone()),
             description: Property::new(source.device.description.clone()),
             card_index: Property::new(source.device.card_index),
@@ -258,35 +265,54 @@ impl InputDevice {
         self.flags.set(source.device.flags);
     }
 
+    fn target(&self) -> DeviceTarget {
+        DeviceTarget {
+            key: self.key,
+            instance: Some(self.instance),
+        }
+    }
+
     /// Set the volume for this input device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_volume(&self, volume: Volume) -> Result<(), Error> {
-        InputDeviceController::set_volume(&self.command_tx, self.key, volume).await
+        InputDeviceController::set_volume(&self.command_tx, self.target(), volume).await
     }
 
     /// Set the mute state for this input device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_mute(&self, muted: bool) -> Result<(), Error> {
-        InputDeviceController::set_mute(&self.command_tx, self.key, muted).await
+        InputDeviceController::set_mute(&self.command_tx, self.target(), muted).await
     }
 
     /// Set the active port for this input device.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_port(&self, port: String) -> Result<(), Error> {
-        InputDeviceController::set_port(&self.command_tx, self.key, port).await
+        InputDeviceController::set_port(&self.command_tx, self.target(), port).await
     }
 
     /// Set this device as the default input.
     ///
     /// # Errors
-    /// Returns error if backend communication fails or device operation fails.
+    /// Returns [`Error::DeviceNotFound`] if the device this handle was created
+    /// for is gone, including after the audio server restarted (even if another
+    /// device now has the same index), and [`Error::NotConnected`] while the
+    /// audio server is not connected.
     pub async fn set_as_default(&self) -> Result<(), Error> {
-        InputDeviceController::set_as_default(&self.command_tx, self.key).await
+        InputDeviceController::set_as_default(&self.command_tx, self.target()).await
     }
 }

@@ -9,10 +9,11 @@ use libpulse_binding::{
 use crate::{
     backend::{
         conversion::device::{from_sink, from_source},
-        types::{DeviceStore, EventSender},
+        types::{DeviceStore, EventSender, next_instance},
     },
+    error::Error,
     events::AudioEvent,
-    types::device::{Device, DeviceKey, DeviceType},
+    types::device::{Device, DeviceKey, DeviceTarget, DeviceType},
 };
 
 pub(crate) fn trigger_discovery(context: &Context, devices: &DeviceStore, events_tx: &EventSender) {
@@ -94,7 +95,7 @@ pub(crate) fn trigger_refresh(
 
 pub(crate) fn process_device_update(
     device_key: DeviceKey,
-    device_data: Device,
+    mut device_data: Device,
     devices: &DeviceStore,
     events_tx: &EventSender,
 ) {
@@ -102,10 +103,13 @@ pub(crate) fn process_device_update(
         return;
     };
 
-    let is_new = !devices_guard.contains_key(&device_key);
+    let existing = devices_guard
+        .get(&device_key)
+        .map(|device| device.info().instance);
+    device_data.info_mut().instance = existing.unwrap_or_else(next_instance);
     devices_guard.insert(device_key, device_data.clone());
 
-    let event = if is_new {
+    let event = if existing.is_none() {
         AudioEvent::DeviceAdded(device_data)
     } else {
         AudioEvent::DeviceChanged(device_data)
@@ -114,98 +118,77 @@ pub(crate) fn process_device_update(
     let _ = events_tx.send(event);
 }
 
+/// Returns the server name of the device `target` addresses.
+///
+/// Fails with [`Error::DeviceNotFound`] when no device has the key, or when
+/// the device there is not the one the caller saw (its instance differs):
+/// the server reuses indices, so after a restart or a hotplug the same index
+/// can name an unrelated device.
+pub(crate) fn resolve_device_name(
+    devices: &DeviceStore,
+    target: DeviceTarget,
+) -> Result<String, Error> {
+    let devices = devices.read().map_err(|_| Error::LockPoisoned)?;
+    devices
+        .get(&target.key)
+        .map(Device::info)
+        .filter(|info| {
+            target
+                .instance
+                .is_none_or(|instance| instance == info.instance)
+        })
+        .map(|info| info.name.clone())
+        .ok_or(Error::DeviceNotFound {
+            index: target.key.index,
+            device_type: target.key.device_type,
+        })
+}
+
+// Devices are addressed by name: unlike indices, names are stable for the
+// lifetime of a device, so a request can never land on a different device
+// even if it reaches the server after the index was reused.
+
 pub(crate) fn set_device_volume(
     context: &Context,
-    device_key: DeviceKey,
-    volume: ChannelVolumes,
     devices: &DeviceStore,
-) {
-    let devices_clone = Arc::clone(devices);
+    target: DeviceTarget,
+    volume: &ChannelVolumes,
+) -> Result<(), Error> {
+    let name = resolve_device_name(devices, target)?;
     let mut introspect = context.introspect();
-
-    let device_info = {
-        if let Ok(devices_guard) = devices_clone.read() {
-            devices_guard
-                .values()
-                .find(|d| d.key() == device_key)
-                .cloned()
-        } else {
-            return;
-        }
+    match target.key.device_type {
+        DeviceType::Output => introspect.set_sink_volume_by_name(&name, volume, None),
+        DeviceType::Input => introspect.set_source_volume_by_name(&name, volume, None),
     };
-
-    if let Some(info) = device_info {
-        match info.key().device_type {
-            DeviceType::Output => {
-                introspect.set_sink_volume_by_index(device_key.index, &volume, None);
-            }
-            DeviceType::Input => {
-                introspect.set_source_volume_by_index(device_key.index, &volume, None);
-            }
-        }
-    }
+    Ok(())
 }
 
 pub(crate) fn set_device_mute(
     context: &Context,
-    device_key: DeviceKey,
-    muted: bool,
     devices: &DeviceStore,
-) {
-    let devices_clone = Arc::clone(devices);
+    target: DeviceTarget,
+    muted: bool,
+) -> Result<(), Error> {
+    let name = resolve_device_name(devices, target)?;
     let mut introspect = context.introspect();
-
-    let device_info = {
-        if let Ok(devices_guard) = devices_clone.read() {
-            devices_guard
-                .values()
-                .find(|d| d.key() == device_key)
-                .cloned()
-        } else {
-            return;
-        }
+    match target.key.device_type {
+        DeviceType::Output => introspect.set_sink_mute_by_name(&name, muted, None),
+        DeviceType::Input => introspect.set_source_mute_by_name(&name, muted, None),
     };
-
-    if let Some(info) = device_info {
-        match info.key().device_type {
-            DeviceType::Output => {
-                introspect.set_sink_mute_by_index(device_key.index, muted, None);
-            }
-            DeviceType::Input => {
-                introspect.set_source_mute_by_index(device_key.index, muted, None);
-            }
-        }
-    }
+    Ok(())
 }
 
 pub(crate) fn set_device_port(
     context: &Context,
-    device_key: DeviceKey,
-    port: String,
     devices: &DeviceStore,
-) {
-    let devices_clone = Arc::clone(devices);
+    target: DeviceTarget,
+    port: &str,
+) -> Result<(), Error> {
+    let name = resolve_device_name(devices, target)?;
     let mut introspect = context.introspect();
-
-    let device_info = {
-        if let Ok(devices_guard) = devices_clone.read() {
-            devices_guard
-                .values()
-                .find(|d| d.key() == device_key)
-                .cloned()
-        } else {
-            return;
-        }
+    match target.key.device_type {
+        DeviceType::Output => introspect.set_sink_port_by_name(&name, port, None),
+        DeviceType::Input => introspect.set_source_port_by_name(&name, port, None),
     };
-
-    if let Some(info) = device_info {
-        match info.key().device_type {
-            DeviceType::Output => {
-                introspect.set_sink_port_by_index(device_key.index, &port, None);
-            }
-            DeviceType::Input => {
-                introspect.set_source_port_by_index(device_key.index, &port, None);
-            }
-        }
-    }
+    Ok(())
 }

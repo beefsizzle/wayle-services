@@ -14,6 +14,8 @@ pub(crate) fn from_sink(sink: &PulseSinkInfo) -> SinkInfo {
     SinkInfo {
         device: DeviceInfo {
             index: sink.index,
+            // Assigned when the object is stored.
+            instance: 0,
             name: cow_to_string(sink.name.as_ref()),
             description: cow_to_string(sink.description.as_ref()),
             card_index: sink.card,
@@ -43,6 +45,8 @@ pub(crate) fn from_source(source: &PulseSourceInfo) -> SourceInfo {
     SourceInfo {
         device: DeviceInfo {
             index: source.index,
+            // Assigned when the object is stored.
+            instance: 0,
             name: cow_to_string(source.name.as_ref()),
             description: cow_to_string(source.description.as_ref()),
             card_index: source.card,
