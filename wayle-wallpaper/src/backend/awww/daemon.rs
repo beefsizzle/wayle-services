@@ -12,24 +12,35 @@ use tracing::{debug, info, warn};
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Spawns the wallpaper daemon in the background if not already running.
+/// Starts a background thread that spawns the wallpaper daemon if it is not already running.
 ///
 /// Prefers `awww-daemon`, falling back to `swww-daemon` if awww is not
-/// installed. Polls until the daemon is accepting commands, then marks startup as settled so
-/// [`super::wait_for_daemon`] callers proceed.
+/// installed. The thread polls until the daemon is accepting commands, then marks startup as
+/// settled so [`AwwwBackend::apply`](super::AwwwBackend::apply) callers proceed. Does nothing
+/// if a startup thread is already in flight.
 pub fn spawn_daemon_if_needed() {
-    super::mark_daemon_starting();
+    if !super::mark_daemon_starting() {
+        return;
+    }
     thread::spawn(ensure_daemon_ready);
 }
 
+/// Marks startup as settled when dropped, so a panic cannot leave callers waiting.
+struct SettleOnDrop;
+
+impl Drop for SettleOnDrop {
+    fn drop(&mut self) {
+        super::mark_daemon_settled();
+    }
+}
+
 fn ensure_daemon_ready() {
+    let _settle = SettleOnDrop;
     let daemon = super::daemon_binary();
 
     if should_wait_for_ready(daemon) {
         wait_until_ready(daemon);
     }
-
-    super::mark_daemon_settled();
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -60,7 +71,7 @@ fn wait_until_ready(daemon: &str) {
     while start.elapsed() < READY_TIMEOUT {
         thread::sleep(READY_POLL_INTERVAL);
 
-        if let Ok(true) = is_daemon_running() {
+        if let Ok(true) = daemon_lists_outputs() {
             debug!(elapsed_ms = start.elapsed().as_millis(), "{daemon} ready");
             return;
         }
@@ -77,6 +88,19 @@ fn is_daemon_running() -> Result<bool, io::Error> {
         .status()?;
 
     Ok(output.success())
+}
+
+/// A freshly started daemon answers `query` before it has enumerated outputs, with an empty
+/// listing. Requests sent in that window fail, and the daemon can abort on them, so only treat
+/// it as ready once at least one output is listed.
+fn daemon_lists_outputs() -> Result<bool, io::Error> {
+    let output = Command::new(super::client_binary())
+        .arg("query")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+
+    Ok(output.status.success() && !output.stdout.trim_ascii().is_empty())
 }
 
 fn start_daemon() -> Result<(), io::Error> {

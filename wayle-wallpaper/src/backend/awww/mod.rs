@@ -14,8 +14,11 @@ use std::{
 };
 
 pub(crate) use daemon::spawn_daemon_if_needed;
-use tokio::{process::Command, sync::Notify};
-use tracing::{debug, instrument};
+use tokio::{
+    process::Command,
+    sync::{Mutex, Notify},
+};
+use tracing::{debug, instrument, warn};
 pub use transition::{
     BezierCurve, Position, TransitionAngle, TransitionConfig, TransitionDuration, TransitionFps,
     TransitionStep, TransitionType, WaveDimensions,
@@ -40,8 +43,15 @@ const OUTPUTS_RETRY_DELAY: Duration = Duration::from_millis(200);
 static DAEMON_STATE: AtomicU8 = AtomicU8::new(DAEMON_IDLE);
 static DAEMON_SETTLED_NOTIFY: Notify = Notify::const_new();
 
-fn mark_daemon_starting() {
-    DAEMON_STATE.store(DAEMON_STARTING, Ordering::Release);
+/// Serializes `awww img` invocations. The daemon aborts with a broken-pipe panic when requests
+/// overlap, taking every wallpaper down with it. The client returns as soon as the request is
+/// accepted (tens of ms, not the transition duration), so this does not serialize the
+/// transitions themselves.
+static APPLY_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Returns `false` if a startup thread is already in flight.
+fn mark_daemon_starting() -> bool {
+    DAEMON_STATE.swap(DAEMON_STARTING, Ordering::AcqRel) != DAEMON_STARTING
 }
 
 fn mark_daemon_settled() {
@@ -52,14 +62,14 @@ fn mark_daemon_settled() {
 /// Waits while the daemon startup thread is running (up to 10s).
 ///
 /// Returns immediately once the thread has finished, or if it was never started. Any number
-/// of callers may wait, and late callers see the settled state.
-pub(crate) async fn wait_for_daemon() {
+/// of callers may wait, and late callers see the settled state. If startup is still not
+/// settled after the timeout (for example a hung `query`), it is declared settled so later
+/// callers do not each wait the full timeout again.
+async fn wait_for_daemon() {
     let settled = async {
         loop {
+            // Created before the state check so a `notify_waiters` after the check wakes us.
             let notified = DAEMON_SETTLED_NOTIFY.notified();
-            tokio::pin!(notified);
-            // Register before re-checking so a notify between check and await isn't lost.
-            notified.as_mut().enable();
 
             if DAEMON_STATE.load(Ordering::Acquire) != DAEMON_STARTING {
                 return;
@@ -68,9 +78,29 @@ pub(crate) async fn wait_for_daemon() {
         }
     };
 
-    let _ = tokio::time::timeout(DAEMON_WAIT_TIMEOUT, settled).await;
+    if tokio::time::timeout(DAEMON_WAIT_TIMEOUT, settled)
+        .await
+        .is_err()
+        && DAEMON_STATE
+            .compare_exchange(
+                DAEMON_STARTING,
+                DAEMON_SETTLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        warn!(
+            "wallpaper daemon not ready after {}s, applying without waiting",
+            DAEMON_WAIT_TIMEOUT.as_secs()
+        );
+        DAEMON_SETTLED_NOTIFY.notify_waiters();
+    }
 }
 
+fn outputs_not_ready(output: &std::process::Output) -> bool {
+    !output.status.success() && String::from_utf8_lossy(&output.stderr).contains(OUTPUTS_NOT_READY)
+}
 static CLIENT_BINARY: OnceLock<&str> = OnceLock::new();
 
 fn client_binary() -> &'static str {
@@ -154,7 +184,11 @@ impl AwwwBackend {
 
         let mut retries = 0;
         let output = loop {
-            let output = cmd.output().await.map_err(|err| {
+            let output = {
+                let _serialized = APPLY_LOCK.lock().await;
+                cmd.output().await
+            }
+            .map_err(|err| {
                 if err.kind() == ErrorKind::NotFound {
                     Error::AwwwNotInstalled
                 } else {
@@ -162,10 +196,7 @@ impl AwwwBackend {
                 }
             })?;
 
-            let outputs_not_ready = !output.status.success()
-                && String::from_utf8_lossy(&output.stderr).contains(OUTPUTS_NOT_READY);
-
-            if !outputs_not_ready || retries >= OUTPUTS_RETRY_ATTEMPTS {
+            if !outputs_not_ready(&output) || retries >= OUTPUTS_RETRY_ATTEMPTS {
                 break output;
             }
 
@@ -204,6 +235,11 @@ fn apply_transition_args(cmd: &mut Command, config: &TransitionConfig) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        os::unix::process::ExitStatusExt,
+        process::{ExitStatus, Output},
+    };
+
     use tokio::{
         sync::{Mutex, MutexGuard},
         time::{Instant, sleep, timeout},
@@ -257,5 +293,35 @@ mod tests {
             let released = timeout(Duration::from_secs(2), waiter).await;
             assert!(matches!(released, Ok(Ok(()))));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_startup_is_declared_settled_after_the_timeout() {
+        let _guard = serial().await;
+        mark_daemon_starting();
+
+        wait_for_daemon().await;
+        assert_eq!(DAEMON_STATE.load(Ordering::Acquire), DAEMON_SETTLED);
+
+        let started = Instant::now();
+        wait_for_daemon().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    fn output(code: i32, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn outputs_not_ready_matches_only_failures_with_that_message() {
+        let message = format!("Error: \"{OUTPUTS_NOT_READY}\"");
+
+        assert!(outputs_not_ready(&output(1, &message)));
+        assert!(!outputs_not_ready(&output(0, &message)));
+        assert!(!outputs_not_ready(&output(1, "daemon is not running")));
     }
 }

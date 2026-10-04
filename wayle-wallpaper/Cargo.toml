@@ -25,5 +25,8 @@ smithay-client-toolkit.workspace = true
 wayle-core.workspace = true
 wayle-traits.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
