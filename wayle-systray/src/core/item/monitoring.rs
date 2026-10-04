@@ -10,7 +10,7 @@ use std::{
 use futures::{Stream, StreamExt};
 use tokio::{
     sync::Notify,
-    time::{Duration, sleep},
+    time::{Duration, Instant, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
@@ -32,7 +32,12 @@ use crate::{
     },
 };
 
+/// How long menu signals must stay quiet before the layout is fetched.
 const MENU_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// The longest a layout fetch is deferred after the first signal of a burst, so an app
+/// that never stops signalling still gets its menu refreshed at this rate.
+const MENU_MAX_DELAY: Duration = Duration::from_millis(500);
 
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 
@@ -297,7 +302,7 @@ where
 }
 
 /// Turns bursts of menu signals into one layout fetch once they go quiet for
-/// [`MENU_DEBOUNCE`].
+/// [`MENU_DEBOUNCE`], or [`MENU_MAX_DELAY`] after the burst began, whichever is first.
 async fn debounce_menu(
     menu_signal: Arc<Notify>,
     pending: Arc<PendingRefresh>,
@@ -308,14 +313,16 @@ async fn debounce_menu(
             () = token.cancelled() => return,
             () = menu_signal.notified() => {}
         }
+        let deadline = Instant::now() + MENU_MAX_DELAY;
         loop {
             tokio::select! {
                 () = token.cancelled() => return,
                 () = sleep(MENU_DEBOUNCE) => break,
+                () = sleep_until(deadline) => break,
                 () = menu_signal.notified() => {}
             }
         }
-        debug!("menu signals settled, scheduling layout fetch");
+        debug!("menu signals settled or deferred long enough, scheduling layout fetch");
         pending.request(PendingRefresh::MENU);
     }
 }
@@ -582,6 +589,56 @@ mod tests {
 
         assert!(woke.is_ok());
         assert_eq!(pending.take(), PendingRefresh::ICON);
+    }
+
+    /// Runs the menu debouncer against `signal_at` (offsets of incoming menu signals) on
+    /// paused time and returns the offsets at which it scheduled a layout fetch.
+    async fn menu_fetches(signal_at: &[u64], run_for: u64) -> Vec<u64> {
+        let menu_signal = Arc::new(Notify::new());
+        let pending = Arc::new(PendingRefresh::default());
+        let token = CancellationToken::new();
+        tokio::spawn(debounce_menu(
+            Arc::clone(&menu_signal),
+            Arc::clone(&pending),
+            token.clone(),
+        ));
+
+        let mut fetches = Vec::new();
+        for ms in 0..=run_for {
+            if signal_at.contains(&ms) {
+                menu_signal.notify_one();
+            }
+            // Let the debouncer observe this millisecond before time moves on.
+            tokio::task::yield_now().await;
+            if pending.take() & PendingRefresh::MENU != 0 {
+                fetches.push(ms);
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        token.cancel();
+        fetches
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn menu_burst_is_fetched_once_after_it_settles() {
+        let fetches = menu_fetches(&[0, 10, 20, 30], 1000).await;
+
+        assert_eq!(fetches.len(), 1, "{fetches:?}");
+        assert!((130..=132).contains(&fetches[0]), "{fetches:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn menu_signals_that_never_settle_are_still_fetched() {
+        // A signal every 50 ms never leaves the 100 ms of quiet the debounce waits for.
+        let signals: Vec<u64> = (0..2000).step_by(50).collect();
+
+        let fetches = menu_fetches(&signals, 2000).await;
+
+        assert!(fetches.len() >= 3, "{fetches:?}");
+        assert!((500..=502).contains(&fetches[0]), "{fetches:?}");
+        for pair in fetches.windows(2) {
+            assert!(pair[1] - pair[0] <= 552, "{fetches:?}");
+        }
     }
 
     #[tokio::test]
