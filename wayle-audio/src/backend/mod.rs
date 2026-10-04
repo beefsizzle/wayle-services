@@ -15,12 +15,15 @@ use std::{
 
 use commands::Command;
 use conversion::volume::to_pulse as convert_volume_to_pulse;
-use dispatcher::{handle_external_command, handle_internal_command};
+use dispatcher::{ensure_ready, handle_external_command, handle_internal_command};
 use libpulse_binding::context::{Context, FlagSet as ContextFlags, State as ContextState};
 use supervisor::{Connector, SessionEnd, SupervisorConfig, supervise};
 use tokio::{
     runtime::Handle,
-    sync::mpsc::{self, error::SendError},
+    sync::{
+        Notify,
+        mpsc::{self, error::SendError},
+    },
     task::{JoinHandle, spawn, spawn_blocking},
 };
 use tokio_util::sync::CancellationToken;
@@ -356,6 +359,7 @@ impl PulseBackend {
         connection: &mut PulseConnection,
         session_token: CancellationToken,
     ) -> Result<(JoinHandle<()>, SessionChannels), Error> {
+        ensure_ready(&connection.context)?;
         let (internal_command_tx, internal_command_rx) =
             mpsc::unbounded_channel::<InternalRefresh>();
 
@@ -449,7 +453,22 @@ impl Connector for PulseBackend {
         info!("PulseAudio backend fully initialized and monitoring");
         self.gate.set_connected(true);
 
+        // The context can fail without the mainloop tick reporting any work,
+        // e.g. when a write from a deferred callback hits a closed socket.
+        // Have every state change wake the loop so the check below runs.
+        let state_changed = Arc::new(Notify::new());
+        let notify = Arc::clone(&state_changed);
+        connection
+            .context
+            .set_state_callback(Some(Box::new(move || notify.notify_one())));
+
         let end = loop {
+            let state = connection.context.get_state();
+            if state != ContextState::Ready {
+                warn!(?state, "PulseAudio context is no longer usable");
+                break SessionEnd::Disconnected;
+            }
+
             tokio::select! {
                 biased;
 
@@ -463,16 +482,15 @@ impl Connector for PulseBackend {
                         warn!("PulseAudio mainloop quit requested");
                         break SessionEnd::Disconnected;
                     }
-
-                    let state = connection.context.get_state();
-                    if !state.is_good() {
-                        warn!(?state, "PulseAudio context is no longer usable");
-                        break SessionEnd::Disconnected;
-                    }
                 }
 
+                () = state_changed.notified() => {}
+
+                // Both handlers fail only when the context is no longer
+                // ready; the check at the top of the loop then ends the
+                // session.
                 Some(cmd) = internal_rx.recv() => {
-                    handle_internal_command(
+                    let _ = handle_internal_command(
                         &mut connection.context,
                         cmd,
                         &self.state.devices,
@@ -909,5 +927,42 @@ mod tests {
         state.streams.write().unwrap().remove(&key);
         commands::stream::process_stream_update(key, info, &state.streams, &event_tx);
         assert_ne!(stored_instance(&state), first);
+    }
+
+    #[tokio::test]
+    async fn requests_on_a_context_that_is_not_ready_are_refused() {
+        // Declared first so it drops after the context.
+        let mainloop = TokioMain::new();
+        let mut context = Context::new(&mainloop, "wayle-audio-test").unwrap();
+        assert_eq!(context.get_state(), ContextState::Unconnected);
+        let state = populated_state();
+        let (event_tx, _event_rx) = broadcast::channel(100);
+
+        // Reaching libpulse with this context would panic in
+        // libpulse-binding (null operation); the guard must refuse first.
+        let mutation = Mutation::SetDeviceVolume {
+            device: device_target(&sink(1), Some(1)),
+            volume: convert_volume_to_pulse(&Volume::stereo(0.5, 0.5)),
+        };
+        let result =
+            handle_external_command(&mut context, mutation, &state.devices, &state.streams);
+        assert!(matches!(result, Err(Error::NotConnected)), "{result:?}");
+
+        for refresh in [
+            InternalRefresh::Devices,
+            InternalRefresh::Streams,
+            InternalRefresh::ServerInfo,
+        ] {
+            let result = handle_internal_command(
+                &mut context,
+                refresh,
+                &state.devices,
+                &state.streams,
+                &event_tx,
+                &state.default_input,
+                &state.default_output,
+            );
+            assert!(matches!(result, Err(Error::NotConnected)), "{result:?}");
+        }
     }
 }
