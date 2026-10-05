@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env, fs,
     sync::{Arc, Mutex},
 };
 
@@ -9,6 +8,7 @@ use derive_more::Debug;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
+use wayle_core::paths::ConfigPaths;
 use zbus::zvariant::{
     LE, OwnedValue, Value,
     serialized::{Context, Data},
@@ -232,7 +232,10 @@ fn stored_portal_action(action: &PortalAction) -> StoredAction {
     StoredAction {
         name: action.name.clone(),
         target: action.target.as_ref().and_then(encode_target),
-        purpose: action.purpose.as_ref().map(|purpose| purpose.as_str().to_owned()),
+        purpose: action
+            .purpose
+            .as_ref()
+            .map(|purpose| purpose.as_str().to_owned()),
     }
 }
 
@@ -285,15 +288,13 @@ pub(crate) struct NotificationStore {
 impl NotificationStore {
     #[instrument(err)]
     pub fn new() -> Result<Self, Error> {
-        let home = env::var("HOME")
-            .map_err(|_| Error::DatabaseError(String::from("HOME environment variable not set")))?;
+        // `data_dir` honours XDG_DATA_HOME (falling back to ~/.local/share) and creates the
+        // directory, like every other wayle data file.
+        let data_dir = ConfigPaths::data_dir()
+            .map_err(|err| Error::DatabaseError(format!("cannot resolve data directory: {err}")))?;
 
-        let data_dir = format!("{home}/.local/share/wayle");
-        fs::create_dir_all(&data_dir)
-            .map_err(|err| Error::DatabaseError(format!("cannot create data directory: {err}")))?;
-
-        let db_path = format!("{data_dir}/notifications.db");
-        debug!(path = %db_path, "notification store opened");
+        let db_path = data_dir.join("notifications.db");
+        debug!(path = %db_path.display(), "notification store opened");
         let connection = Connection::open(db_path)
             .map_err(|err| Error::DatabaseError(format!("cannot open database: {err}")))?;
 
@@ -899,7 +900,11 @@ mod tests {
         let reply_action = dispatch.reply_action.expect("reply action preserved");
         assert_eq!(reply_action.name, "app.inline-reply");
         assert_eq!(
-            reply_action.target.unwrap().downcast_ref::<String>().unwrap(),
+            reply_action
+                .target
+                .unwrap()
+                .downcast_ref::<String>()
+                .unwrap(),
             "thread-1"
         );
         assert_eq!(reply_action.purpose, Some(ButtonPurpose::ImReplyWithText));
